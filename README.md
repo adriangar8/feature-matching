@@ -1,6 +1,7 @@
 # 🧠 Meta-Feature Matching: From Forgetting to Meta-Learning Adaptation
 
 This repository implements a complete experimental framework for studying **meta-learning in feature matching and descriptor adaptation**.  
+
 We start from a **pretrained visual descriptor** (e.g. SuperPoint), **fine-tune** it on a specific domain to simulate *catastrophic forgetting*, and then apply **meta-learning (MAML/Reptile)** to **restore generalization and rapid adaptability** across new domains.
 
 ---
