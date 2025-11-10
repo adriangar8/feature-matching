@@ -8,3 +8,4 @@ data/
 wandb/
 .DS_Store
 venv/
+.venv/
