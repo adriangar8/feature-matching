@@ -1,0 +1,11 @@
+base_model: "resnet50"
+meta_lr_inner: 1e-3
+meta_lr_outer: 1e-4
+num_inner_steps: 3
+meta_batch_size: 2
+meta_epochs: 5
+
+tasks: ["viewpoint"] # meta-train *on viewpoint*
+pretrained_path: "results/checkpoints/resnet50_finetuned_illum.pth"
+
+save_path: "results/checkpoints/resnet50_meta_from_illum_to_view.pth"
