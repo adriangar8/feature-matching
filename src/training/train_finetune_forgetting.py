@@ -3,14 +3,13 @@ import torch.nn as nn
 from tqdm import tqdm
 import yaml
 import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from src.utils.logger import init_wandb, log_metrics
 from src.models.descriptor_wrapper import DescriptorWrapper
 from src.datasets.hpatches_loader import get_dataloader
 
 from src.evaluation.metrics import correspondence_accuracy
-from src.evaluation.logging import (
+from src.evaluation.visualization import (
     log_patch_triplets,
     log_tsne,
     log_distance_hist,

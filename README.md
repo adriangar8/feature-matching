@@ -1,217 +1,218 @@
-# 🧠 Meta-Feature Matching: From Forgetting to Meta-Learning Adaptation
+# Meta-Learning for Feature Matching
 
-This repository implements a complete experimental framework for studying **meta-learning in feature matching and descriptor adaptation**.  
+A comprehensive benchmark comparing traditional and deep learning approaches for local feature matching, with a focus on continual learning and domain adaptation.
 
-We start from a **pretrained visual descriptor** (e.g. SuperPoint), **fine-tune** it on a specific domain to simulate *catastrophic forgetting*, and then apply **meta-learning (MAML/Reptile)** to **restore generalization and rapid adaptability** across new domains.
+## Overview
 
----
+This project investigates:
 
-## 📖 Overview
+1. **Traditional vs. Deep Learning Descriptors**: Comparing classical methods (SIFT, ORB, BRISK, AKAZE) with learned CNN descriptors on the HPatches benchmark.
 
-Feature matching lies at the heart of 3D computer vision tasks such as **Structure from Motion**, **Visual SLAM**, and **Multi-View Stereo**.  
-While deep descriptors (SuperPoint, D2-Net, R2D2) outperform classical ones (SIFT, ORB), they often **lose generality after domain-specific fine-tuning**.
+2. **Domain Adaptation**: Evaluating how well models transfer between illumination and viewpoint variations.
 
-This project explores how **meta-learning** can help such models **relearn adaptability** — recovering cross-domain robustness after forgetting.
+3. **Continual Learning**: Comparing methods to prevent catastrophic forgetting when adapting to new domains:
+   - Naive fine-tuning (baseline)
+   - EWC (Elastic Weight Consolidation)
+   - LwF (Learning without Forgetting)
+   - SI (Synaptic Intelligence)
+   - MAML (Model-Agnostic Meta-Learning)
 
----
+## Installation
 
-## 🚀 Project Pipeline
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/meta-feature-matching.git
+cd meta-feature-matching
 
+# Create conda environment
+conda env create -f environment.yml
+conda activate meta-matching
+
+# Or install with pip
+pip install -r requirements.txt
+
+# Set HPatches dataset path
+export HPATCHES_ROOT="/path/to/hpatches"
 ```
-Pretrained Descriptor (SuperPoint)
-          ↓
- Fine-Tune on One Domain (e.g., indoor scenes)
-          ↓
- Model overfits → forgets other domains
-          ↓
- Meta-Learning (MAML/Reptile) across multiple domains
-          ↓
- Regains fast adaptation and generalization ability
+
+### Download HPatches Dataset
+
+```bash
+cd /path/to/data
+wget http://icvl.ee.ic.ac.uk/vbalnt/hpatches/hpatches-sequences-release.tar.gz
+tar -xvf hpatches-sequences-release.tar.gz
+export HPATCHES_ROOT="/path/to/data/hpatches-sequences-release"
 ```
 
----
-
-## 🧩 Key Features
-
-- ✅ **Pretrained Descriptor Backbone**
-  - Plug-and-play support for SuperPoint (extendable to D2-Net or R2D2)
-- 🧠 **Meta-Learning Algorithms**
-  - Implementations of MAML and Reptile using `higher`
-- 🔁 **Catastrophic Forgetting Simulation**
-  - Fine-tuning pipeline for controlled domain specialization
-- 📊 **Cross-Domain Evaluation**
-  - Adaptation speed and matching accuracy metrics
-- 📈 **Integrated W&B Logging**
-  - Metrics, loss curves, and keypoint visualizations logged automatically
-
----
-
-## 🗂️ Repository Structure
+## Project Structure
 
 ```
 meta-feature-matching/
-├── README.md
-├── requirements.txt
-├── setup.sh
-├── configs/
-│   ├── base.yaml
-│   ├── finetune.yaml
-│   ├── maml.yaml
-│   └── reptile.yaml
-├── data/
-│   ├── hpatches/
-│   ├── megadepth/
-│   └── ...
+├── configs/                    # Configuration files
+│   └── benchmark.yaml          # Main benchmark config
+├── scripts/                    # Executable scripts
+│   └── run_benchmark.py        # Full benchmark suite
 ├── src/
-│   ├── models/                # Descriptor architectures (SuperPoint, etc.)
-│   ├── datasets/              # HPatches loaders & meta-task samplers
-│   ├── meta/                  # MAML & Reptile implementations
-│   ├── training/              # Fine-tuning & meta-learning scripts
-│   ├── evaluation/            # Cross-domain and adaptation evaluations
-│   └── utils/                 # Logger, metrics, visualization
-└── results/
-    ├── checkpoints/
-    ├── logs/
-    └── figures/
+│   ├── baselines/              # Baseline methods
+│   │   ├── traditional_matchers.py  # SIFT, ORB, BRISK, AKAZE
+│   │   ├── deep_matcher.py          # Deep learning matcher
+│   │   └── continual_learning.py    # EWC, LwF, SI
+│   ├── datasets/
+│   │   └── hpatches_loader.py  # HPatches data loading
+│   ├── evaluation/
+│   │   ├── metrics.py          # Evaluation metrics
+│   │   └── visualization.py    # Plotting utilities
+│   ├── meta/
+│   │   └── maml.py             # MAML implementation
+│   ├── models/
+│   │   └── descriptor_wrapper.py  # CNN descriptor models
+│   └── utils/
+│       └── logger.py           # Logging utilities
+├── results/                    # Output directory
+├── environment.yml             # Conda environment
+└── README.md
 ```
 
----
+## Quick Start
 
-## ⚙️ Installation
+### Run Full Benchmark
 
-1. **Clone the repo**
-   ```bash
-   git clone https://github.com/<yourusername>/meta-feature-matching.git
-   cd meta-feature-matching
-   ```
-
-2. **Create environment**
-   ```bash
-   bash setup.sh
-   ```
-
-3. **Log in to Weights & Biases**
-   ```bash
-   wandb login
-   ```
-
----
-
-## 📚 Datasets
-
-| Dataset | Use | Domains |
-|----------|------|----------|
-| [HPatches](https://github.com/hpatches/hpatches-dataset) | Training & Evaluation | Illumination, Viewpoint, Blur |
-| [MegaDepth](https://megadepth.cs.cornell.edu/) | Optional fine-tuning | Indoor / Outdoor |
-| ETH3D / PhotoTourism | Optional evaluation | Real scenes with viewpoint variation |
-
-Each domain acts as a **meta-task** in MAML or Reptile.
-
----
-
-## 🧪 Training Pipeline
-
-### 1️⃣ Fine-tune to simulate forgetting
 ```bash
-python src/training/train_finetune_forgetting.py --config configs/finetune.yaml
+python scripts/run_benchmark.py --config configs/benchmark.yaml
 ```
 
-- Starts from a pretrained SuperPoint model.
-- Fine-tunes on a single domain (e.g., illumination).
-- Produces `superpoint_finetuned.pth`.
+### Quick Test (fewer epochs)
 
----
-
-### 2️⃣ Meta-learning restoration (MAML)
 ```bash
-python src/training/train_meta_restore.py --config configs/maml.yaml
+python scripts/run_benchmark.py --quick
 ```
 
-- Loads the fine-tuned checkpoint.
-- Performs meta-learning across multiple domains.
-- Produces `maml_restored.pth`.
+### Individual Evaluations
 
----
+```python
+from src.baselines.traditional_matchers import get_all_matchers
+from src.datasets.hpatches_loader import get_sequence_dataloader
+from src.evaluation.metrics import evaluate_traditional_matcher
 
-### 3️⃣ Evaluate cross-domain generalization
-```bash
-python src/evaluation/eval_cross_domain.py
+# Evaluate SIFT
+matchers = get_all_matchers()
+loader = get_sequence_dataloader("viewpoint")
+results = evaluate_traditional_matcher(matchers["SIFT_BF"], loader)
+print(f"MMA@3px: {results['mma'].mma_3px:.4f}")
 ```
 
-Visualizes:
-- Matching accuracy per domain.
-- Adaptation curves over fine-tuning steps.
-- Embedding space (e.g., t-SNE of descriptors).
+## Methods
 
----
+### Traditional Matchers
 
-## 📊 Experiment Tracking with W&B
+| Method | Detector | Descriptor | Matcher |
+|--------|----------|------------|---------|
+| SIFT_BF | SIFT | SIFT (128-D) | Brute Force |
+| SIFT_FLANN | SIFT | SIFT (128-D) | FLANN |
+| ORB_BF | ORB | ORB (256-bit) | Brute Force |
+| BRISK_BF | BRISK | BRISK (512-bit) | Brute Force |
+| AKAZE_BF | AKAZE | AKAZE (486-bit) | Brute Force |
 
-All experiments are automatically logged to [Weights & Biases](https://wandb.ai):
+### Deep Learning Models
 
-- Training / validation losses
-- Matching accuracy and precision–recall
-- Keypoint match visualizations
-- Hyperparameters (auto-logged from config files)
+| Model | Backbone | Params | Output Dim |
+|-------|----------|--------|------------|
+| ResNet50 | ResNet-50 | ~25M | 512 |
+| ResNet18 | ResNet-18 | ~11M | 512 |
+| Lightweight | Custom CNN | ~0.5M | 128 |
+| HardNet | HardNet-style | ~1M | 128 |
 
-To view results:
-```bash
-wandb sync --clean
+### Continual Learning Methods
+
+| Method | Key Idea | Hyperparameters |
+|--------|----------|-----------------|
+| Naive | No protection | - |
+| EWC | Fisher information penalty | λ=1000 |
+| LwF | Knowledge distillation | λ=1.0, T=2.0 |
+| SI | Online importance | λ=1.0 |
+| MAML | Meta-learning for adaptation | lr_in=1e-3, lr_out=1e-4 |
+
+## Metrics
+
+### Matching Quality
+- **MMA@t**: Mean Matching Accuracy at t-pixel threshold
+- **Inlier Ratio**: Fraction of matches that are geometric inliers
+- **Homography Accuracy**: Corner error < threshold
+
+### Continual Learning
+- **Forgetting**: Accuracy drop on source domain after training on target
+- **Forward Transfer**: Improvement on target domain
+- **Adaptation Curve**: Accuracy vs. adaptation steps (for MAML)
+
+## Expected Results
+
+### Traditional Matchers (HPatches)
+
+| Method | MMA@3px (Illum) | MMA@3px (View) | Time (ms) |
+|--------|-----------------|----------------|-----------|
+| SIFT_BF | ~0.45 | ~0.35 | ~50 |
+| ORB_BF | ~0.30 | ~0.20 | ~10 |
+| AKAZE_BF | ~0.40 | ~0.30 | ~30 |
+
+### Forgetting Comparison
+
+| Method | Forgetting Rate (Illum→View) |
+|--------|------------------------------|
+| Naive | ~30-40% |
+| EWC | ~15-25% |
+| LwF | ~10-20% |
+| SI | ~15-25% |
+| MAML | ~5-15% |
+
+## Configuration
+
+See `configs/benchmark.yaml` for all configurable options:
+
+```yaml
+# Key hyperparameters
+batch_size: 32
+lr: 1.0e-4
+deep_epochs: 15
+epochs_source: 15
+epochs_target: 15
+meta_epochs: 10
+
+# Method-specific
+ewc_lambda: 1000.0
+lwf_lambda: 1.0
+meta_lr_inner: 1.0e-3
 ```
 
----
+## Logging
 
-## 🧠 Results Overview
+Results are logged to:
+- **Weights & Biases**: Real-time metrics and visualizations
+- **TensorBoard**: Optional, enable in config
+- **CSV files**: Local backup in `results/logs/`
+- **JSON**: Complete results in `results.json`
 
-| Stage | In-Domain | Cross-Domain | Adaptation Speed |
-|--------|------------|--------------|------------------|
-| Pretrained SuperPoint | - | - | - |
-| After Fine-Tuning | - | - | - |
-| After Meta-Learning | - | - | - |
+## Citation
 
-Meta-learning successfully restores generalization and adaptability lost after fine-tuning.
+If you use this code, please cite:
 
----
-
-## 🧰 Technologies
-
-- **Python 3.10**, **PyTorch ≥ 2.0**
-- **Higher** for differentiable inner loops
-- **Weights & Biases** for experiment tracking
-- **OpenCV / Matplotlib** for visualization
-
----
-
-## 📄 Citation
-
-If you use this work, please cite or reference:
-
-```bash
-@project{meta_feature_matching_2025,
-  title={Meta-Feature Matching: From Forgetting to Meta-Learning Adaptation},
-  author={Zeeny, Karl},
-  institution={École Polytechnique},
-  year={2025},
-  url={https://github.com/<yourusername>/meta-feature-matching}
+```bibtex
+@misc{meta-feature-matching,
+  title={Meta-Learning for Feature Matching: A Benchmark},
+  author={Your Name},
+  year={2024},
+  howpublished={\url{https://github.com/yourusername/meta-feature-matching}}
 }
 ```
 
----
+## References
 
-## 🧩 Acknowledgments
+- [HPatches](https://github.com/hpatches/hpatches-benchmark) - Balntas et al., 2017
+- [MAML](https://arxiv.org/abs/1703.03400) - Finn et al., 2017
+- [EWC](https://arxiv.org/abs/1612.00796) - Kirkpatrick et al., 2017
+- [LwF](https://arxiv.org/abs/1606.09282) - Li & Hoiem, 2017
+- [SI](https://arxiv.org/abs/1703.04200) - Zenke et al., 2017
+- [HardNet](https://arxiv.org/abs/1705.10872) - Mishchuk et al., 2017
 
-This project builds upon open-source descriptors:
-- [SuperPoint (Magic Leap)](https://github.com/magicleap/SuperPointPretrainedNetwork)
-- [D2-Net](https://github.com/mihaidusmanu/d2-net)
-- [R2D2 (Naver Labs)](https://github.com/naver/r2d2)
+## License
 
-And meta-learning frameworks:
-- [Finn et al., *Model-Agnostic Meta-Learning*, ICML 2017]
-- [Shalam et al., *Matching by Few-Shot Classification*, BMVC 2023]
-
----
-
-## ✨ Author
-
-**Karl Zeeny**  
-**Adrián García**
+MIT License
