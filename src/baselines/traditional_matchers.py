@@ -324,7 +324,7 @@ def get_all_matchers() -> Dict[str, BaseFeatureMatcher]:
         surf = cv2.xfeatures2d.SURF_create()
         matchers["SURF_BF"] = _SURFMatcher(use_flann=False)
         matchers["SURF_FLANN"] = _SURFMatcher(use_flann=True)
-    except AttributeError:
+    except (AttributeError, cv2.error):
         pass  # SURF not available
 
     return matchers
