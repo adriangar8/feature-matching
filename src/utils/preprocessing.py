@@ -1,7 +1,3 @@
-"""
-Patch preprocessing and augmentation utilities.
-"""
-
 import random
 import numpy as np
 import cv2
@@ -10,7 +6,6 @@ from .constants import IMAGENET_MEAN, IMAGENET_STD
 
 
 def normalize_patch(patch: np.ndarray) -> np.ndarray:
-    """Normalize a grayscale patch for ImageNet-pretrained model."""
     if patch.max() > 1.0:
         patch = patch / 255.0
     rgb = np.stack([patch, patch, patch], axis=-1)
@@ -19,7 +14,6 @@ def normalize_patch(patch: np.ndarray) -> np.ndarray:
 
 
 def augment_patch(patch: np.ndarray) -> np.ndarray:
-    """Apply data augmentation to a patch."""
     if random.random() < 0.5:
         delta = random.uniform(-0.2, 0.2)
         patch = np.clip(patch + delta, 0, 1)

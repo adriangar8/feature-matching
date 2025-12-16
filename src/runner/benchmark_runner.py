@@ -1,7 +1,3 @@
-"""
-Main benchmark runner orchestrating all evaluations.
-"""
-
 from pathlib import Path
 from typing import Dict
 from dataclasses import asdict
@@ -11,8 +7,6 @@ import torch
 import wandb
 
 from ..data.hpatches_manager import HPatchesManager
-from ..data.structures import EvalPair
-from ..descriptors.traditional import TraditionalExtractor
 from ..evaluation.evaluator import evaluate_traditional, evaluate_deep
 from ..training.trainer import train_model
 from ..training.continual import train_continual
@@ -25,12 +19,8 @@ from ..utils.visualization import PatchVisualizer
 from src.models.descriptor_wrapper import get_descriptor_model
 
 def run_benchmark(config: Dict) -> Dict:
-    """Run the complete benchmark."""
-    
-    # Initialize visualizer
     visualizer = PatchVisualizer(config.get("output_dir", "results/benchmark"))
     
-    # Initialize wandb
     wandb.init(project="meta-feature-matching-final", config=config)
     
     seed = get_int(config, "seed", 42)
@@ -46,12 +36,8 @@ def run_benchmark(config: Dict) -> Dict:
         "seed": seed,
     }
     
-    # Store models for T-SNE visualization
     tsne_models = {}
     
-    # =========================================================================
-    # Traditional Methods
-    # =========================================================================
     if get_bool(config, "eval_traditional", True):
         print("\n" + "="*70)
         print("EVALUATING TRADITIONAL METHODS")
@@ -83,12 +69,8 @@ def run_benchmark(config: Dict) -> Dict:
                 print(f"  Top-5 Accuracy: {result.accuracy_top5:.4f}")
                 print(f"  Mean Rank: {result.mean_rank:.2f}")
         
-        # Add SIFT to T-SNE models
         tsne_models["SIFT"] = (None, "sift")
     
-    # =========================================================================
-    # Deep Learning Methods
-    # =========================================================================
     if get_bool(config, "eval_deep", True):
         print("\n" + "="*70)
         print("EVALUATING DEEP LEARNING METHODS")
@@ -120,7 +102,6 @@ def run_benchmark(config: Dict) -> Dict:
                 val_pairs=val_pairs,
             )
             
-            # Store for T-SNE
             tsne_models[f"ResNet50 ({train_domain[:5].capitalize()})"] = (deepcopy(model), "deep")
             
             all_results["deep"][f"resnet50_{train_domain}"] = {}
@@ -145,9 +126,6 @@ def run_benchmark(config: Dict) -> Dict:
                 print(f"  Top-5 Accuracy: {result.accuracy_top5:.4f}")
                 print(f"  Mean Rank: {result.mean_rank:.2f}")
     
-    # =========================================================================
-    # Continual Learning
-    # =========================================================================
     if get_bool(config, "eval_continual", True):
         print("\n" + "="*70)
         print("EVALUATING CONTINUAL LEARNING METHODS")
@@ -257,9 +235,6 @@ def run_benchmark(config: Dict) -> Dict:
                     f"continual_{transfer_key}_{method}_forgetting_rate": forgetting_rate * 100
                 })
     
-    # =========================================================================
-    # Generate T-SNE Visualizations
-    # =========================================================================
     print("\n" + "="*70)
     print("GENERATING T-SNE VISUALIZATIONS")
     print("="*70)
@@ -270,7 +245,6 @@ def run_benchmark(config: Dict) -> Dict:
     
     tsne_viz = TSNEVisualizer(tsne_dir)
     
-    # Create samples for T-SNE
     tsne_samples = []
     illum_seqs = data_mgr.get_sequences("illumination", "test")[:2]
     view_seqs = data_mgr.get_sequences("viewpoint", "test")[:2]
@@ -286,7 +260,6 @@ def run_benchmark(config: Dict) -> Dict:
             tsne_samples.append(sample)
     
     if tsne_samples and tsne_models:
-        # Create individual T-SNE figures
         for sample in tsne_samples:
             for model_name, (model, model_type) in tsne_models.items():
                 if model_type == "sift":
@@ -307,15 +280,11 @@ def run_benchmark(config: Dict) -> Dict:
                     tsne_dir / f"global_{safe_name}_{sample.domain}_{sample.seq_name}.png"
                 )
         
-        # Create combined comparison figure
         tsne_viz.create_combined_tsne_figure(
             tsne_samples, tsne_models, device,
             tsne_dir / "tsne_comparison_all_models.png"
         )
     
-    # =========================================================================
-    # Generate Qualitative Matching Comparisons
-    # =========================================================================
     if get_bool(config, "generate_comparisons", True) and tsne_models:
         print("\\n" + "="*70)
         print("GENERATING MATCHING COMPARISONS (SIFT vs Learned)")
@@ -324,7 +293,6 @@ def run_benchmark(config: Dict) -> Dict:
         comparison_dir = output_dir / "matching_comparisons"
         comparison_viz = MatchingComparisonVisualizer(comparison_dir)
         
-        # Use the best learned model (viewpoint-trained for viewpoint, illumination-trained for illumination)
         for model_name, (model, model_type) in tsne_models.items():
             if model_type == "deep" and model is not None:
                 comparison_viz.generate_comparisons(
@@ -335,11 +303,8 @@ def run_benchmark(config: Dict) -> Dict:
                     max_distractors=100,
                     model_name=model_name
                 )
-                break  # Just use one model for comparisons
+                break  
     
-    # =========================================================================
-    # Generate Paper Figures
-    # =========================================================================
     print("\n" + "="*70)
     print("GENERATING PAPER FIGURES")
     print("="*70)
@@ -349,16 +314,12 @@ def run_benchmark(config: Dict) -> Dict:
     
     create_methodology_figure(figures_dir)
     
-    # =========================================================================
-    # Generate Standard Visualizations
-    # =========================================================================
     print("\n" + "="*70)
     print("GENERATING STANDARD VISUALIZATIONS")
     print("="*70)
     
     visualizer.create_all_figures(results=all_results)
     
-    # Save results
     results_file = output_dir / "results.json"
     with open(results_file, "w") as f:
         json.dump(all_results, f, indent=2, default=str)
@@ -371,7 +332,6 @@ def run_benchmark(config: Dict) -> Dict:
     print(f"\nResults saved to: {results_file}")
     print(f"Summary saved to: {summary_file}")
     
-    # Print comprehensive summary
     print("\n" + "="*70)
     print("COMPREHENSIVE SUMMARY")
     print("="*70)

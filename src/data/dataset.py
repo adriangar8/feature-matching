@@ -1,7 +1,3 @@
-"""
-PyTorch Dataset for triplet training.
-"""
-
 import random
 from typing import List, Tuple
 import torch
@@ -9,10 +5,7 @@ import numpy as np
 
 from ..utils.preprocessing import normalize_patch, augment_patch
 
-
-class TripletDataset(torch.utils.data.Dataset):
-    """PyTorch dataset with proper normalization and augmentation."""
-    
+class TripletDataset(torch.utils.data.Dataset):    
     def __init__(self, triplets: List[Tuple], augment: bool = True):
         self.triplets = triplets
         self.augment = augment

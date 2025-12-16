@@ -1,7 +1,3 @@
-"""
-Methodology figure creation for paper.
-"""
-
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,23 +5,18 @@ import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 
 def create_methodology_figure(output_dir: Path):
-    """Create methodology diagram for paper."""
-    
     fig = plt.figure(figsize=(14, 8))
     gs = GridSpec(2, 3, figure=fig, height_ratios=[1, 1.2], hspace=0.3, wspace=0.3)
     
-    # Colors
     query_color = '#9B59B6'
     match_color = '#27AE60'
     distractor_color = '#E67E22'
     
-    # Top row: Triplet sampling
     ax_triplet = fig.add_subplot(gs[0, :])
     ax_triplet.set_xlim(0, 10)
     ax_triplet.set_ylim(0, 3)
     ax_triplet.axis('off')
     
-    # Draw anchor
     anchor_rect = mpatches.FancyBboxPatch((0.5, 1), 1.5, 1.5, 
                                            boxstyle="round,pad=0.05",
                                            facecolor=query_color, alpha=0.3,
@@ -33,7 +24,6 @@ def create_methodology_figure(output_dir: Path):
     ax_triplet.add_patch(anchor_rect)
     ax_triplet.text(1.25, 0.6, 'Anchor\n(Query)', ha='center', fontsize=11, fontweight='bold')
     
-    # Draw positive
     pos_rect = mpatches.FancyBboxPatch((3.5, 1), 1.5, 1.5,
                                        boxstyle="round,pad=0.05",
                                        facecolor=match_color, alpha=0.3,
@@ -41,7 +31,6 @@ def create_methodology_figure(output_dir: Path):
     ax_triplet.add_patch(pos_rect)
     ax_triplet.text(4.25, 0.6, 'Positive\n(Match)', ha='center', fontsize=11, fontweight='bold')
     
-    # Draw negative
     neg_rect = mpatches.FancyBboxPatch((6.5, 1), 1.5, 1.5,
                                        boxstyle="round,pad=0.05",
                                        facecolor=distractor_color, alpha=0.3,
@@ -49,7 +38,6 @@ def create_methodology_figure(output_dir: Path):
     ax_triplet.add_patch(neg_rect)
     ax_triplet.text(7.25, 0.6, 'Negative\n(Distractor)', ha='center', fontsize=11, fontweight='bold')
     
-    # Arrows
     ax_triplet.annotate('', xy=(3.4, 1.75), xytext=(2.1, 1.75),
                        arrowprops=dict(arrowstyle='->', color=match_color, lw=2))
     ax_triplet.text(2.75, 2.0, 'Pull\nCloser', ha='center', fontsize=10, color=match_color)
@@ -61,12 +49,10 @@ def create_methodology_figure(output_dir: Path):
     ax_triplet.set_title('Triplet Contrastive Learning: Learning Invariant Descriptors', 
                         fontsize=14, fontweight='bold', pad=10)
     
-    # Bottom row: Embedding space before/after
     ax_before = fig.add_subplot(gs[1, 0])
     ax_after = fig.add_subplot(gs[1, 1])
     ax_loss = fig.add_subplot(gs[1, 2])
     
-    # Before training
     np.random.seed(42)
     n_points = 15
     before_query = np.array([0, 0])
@@ -88,7 +74,6 @@ def create_methodology_figure(output_dir: Path):
     ax_before.grid(True, alpha=0.3)
     ax_before.legend(loc='upper right', fontsize=9)
     
-    # After training
     after_query = np.array([0, 0])
     after_pos = np.array([0.2, 0.15])
     angles = np.linspace(0, 2*np.pi, n_points, endpoint=False)
@@ -113,7 +98,6 @@ def create_methodology_figure(output_dir: Path):
     ax_after.grid(True, alpha=0.3)
     ax_after.legend(loc='upper right', fontsize=9)
     
-    # Loss function
     ax_loss.text(0.5, 0.85, 'Triplet Loss:', ha='center', fontsize=12, fontweight='bold',
                 transform=ax_loss.transAxes)
     ax_loss.text(0.5, 0.65, r'$\mathcal{L} = \max(0, d_+ - d_- + m)$', ha='center', fontsize=14,

@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-Generate Paper Figures
-
-This script generates:
-1. methodology_contrastive_learning.png - Contrastive learning diagram
-2. Domain example images (illum_ref.png, illum_target.png, view_ref.png, view_target.png)
-
-Usage:
-    python generate_paper_figures.py --hpatches /path/to/hpatches --output figures/
-"""
-
 import argparse
 import numpy as np
 import cv2
@@ -19,24 +7,19 @@ from matplotlib.gridspec import GridSpec
 from pathlib import Path
 
 
-def create_methodology_figure(output_dir: Path):
-    """Create contrastive learning methodology diagram."""
-    
+def create_methodology_figure(output_dir: Path):    
     fig = plt.figure(figsize=(10, 6))
     gs = GridSpec(2, 3, figure=fig, height_ratios=[1, 1.2], hspace=0.35, wspace=0.3)
     
-    # Colors
-    query_color = '#9B59B6'      # Purple
-    match_color = '#27AE60'       # Green
-    distractor_color = '#E67E22'  # Orange
+    query_color = '#9B59B6'      
+    match_color = '#27AE60'       
+    distractor_color = '#E67E22'  
     
-    # Top row: Triplet sampling
     ax_triplet = fig.add_subplot(gs[0, :])
     ax_triplet.set_xlim(0, 10)
     ax_triplet.set_ylim(0, 3)
     ax_triplet.axis('off')
     
-    # Draw anchor
     anchor_rect = mpatches.FancyBboxPatch((0.5, 0.8), 1.8, 1.8, 
                                            boxstyle="round,pad=0.05",
                                            facecolor=query_color, alpha=0.3,
@@ -44,7 +27,6 @@ def create_methodology_figure(output_dir: Path):
     ax_triplet.add_patch(anchor_rect)
     ax_triplet.text(1.4, 0.4, 'Anchor\n(Query)', ha='center', fontsize=10, fontweight='bold')
     
-    # Draw positive
     pos_rect = mpatches.FancyBboxPatch((3.6, 0.8), 1.8, 1.8,
                                        boxstyle="round,pad=0.05",
                                        facecolor=match_color, alpha=0.3,
@@ -52,7 +34,6 @@ def create_methodology_figure(output_dir: Path):
     ax_triplet.add_patch(pos_rect)
     ax_triplet.text(4.5, 0.4, 'Positive\n(Match)', ha='center', fontsize=10, fontweight='bold')
     
-    # Draw negative
     neg_rect = mpatches.FancyBboxPatch((6.7, 0.8), 1.8, 1.8,
                                        boxstyle="round,pad=0.05",
                                        facecolor=distractor_color, alpha=0.3,
@@ -60,7 +41,6 @@ def create_methodology_figure(output_dir: Path):
     ax_triplet.add_patch(neg_rect)
     ax_triplet.text(7.6, 0.4, 'Negative\n(Distractor)', ha='center', fontsize=10, fontweight='bold')
     
-    # Arrows
     ax_triplet.annotate('', xy=(3.5, 1.7), xytext=(2.4, 1.7),
                        arrowprops=dict(arrowstyle='->', color=match_color, lw=2.5))
     ax_triplet.text(2.95, 2.1, 'Pull\nCloser', ha='center', fontsize=9, color=match_color, fontweight='bold')
@@ -71,12 +51,10 @@ def create_methodology_figure(output_dir: Path):
     
     ax_triplet.set_title('Triplet Contrastive Learning', fontsize=12, fontweight='bold', pad=10)
     
-    # Bottom row: Embedding space before/after
     ax_before = fig.add_subplot(gs[1, 0])
     ax_after = fig.add_subplot(gs[1, 1])
     ax_loss = fig.add_subplot(gs[1, 2])
     
-    # Before training - random embeddings
     np.random.seed(42)
     n_points = 12
     before_query = np.array([0, 0])
@@ -98,7 +76,6 @@ def create_methodology_figure(output_dir: Path):
     ax_before.grid(True, alpha=0.3)
     ax_before.set_aspect('equal')
     
-    # After training - structured embeddings
     after_query = np.array([0, 0])
     after_pos = np.array([0.15, 0.12])
     angles = np.linspace(0, 2*np.pi, n_points, endpoint=False)
@@ -112,7 +89,6 @@ def create_methodology_figure(output_dir: Path):
     ax_after.scatter(after_query[0], after_query[1], c=query_color,
                     s=120, marker='^', edgecolors='black', linewidths=1.5, label='Query')
     
-    # Draw margin circle
     circle = plt.Circle((0, 0), 0.3, fill=False, color='gray', linestyle='--', linewidth=1.5) # type: ignore
     ax_after.add_patch(circle)
     ax_after.text(0.35, -0.1, 'm', fontsize=9, color='gray', style='italic')
@@ -126,7 +102,6 @@ def create_methodology_figure(output_dir: Path):
     ax_after.legend(loc='upper right', fontsize=7)
     ax_after.set_aspect('equal')
     
-    # Loss function panel
     ax_loss.text(0.5, 0.82, 'Triplet Loss:', ha='center', fontsize=11, fontweight='bold',
                 transform=ax_loss.transAxes)
     ax_loss.text(0.5, 0.62, r'$\mathcal{L} = \max(0, d_+ - d_- + m)$', ha='center', fontsize=12,
@@ -152,9 +127,6 @@ def create_methodology_figure(output_dir: Path):
 
 
 def extract_domain_examples(hpatches_root: Path, output_dir: Path):
-    """Extract example images from HPatches for illumination and viewpoint domains."""
-    
-    # Find illumination and viewpoint sequences
     illum_seqs = sorted([d for d in hpatches_root.iterdir() if d.name.startswith('i_') and d.is_dir()])
     view_seqs = sorted([d for d in hpatches_root.iterdir() if d.name.startswith('v_') and d.is_dir()])
     
@@ -162,19 +134,16 @@ def extract_domain_examples(hpatches_root: Path, output_dir: Path):
         print("Warning: Could not find HPatches sequences")
         return
     
-    # Select good examples (first few sequences are usually good)
     illum_seq = illum_seqs[0]
     view_seq = view_seqs[0]
     
     print(f"Using illumination sequence: {illum_seq.name}")
     print(f"Using viewpoint sequence: {view_seq.name}")
     
-    # Load and save illumination images
     illum_ref = cv2.imread(str(illum_seq / "1.ppm"))
-    illum_target = cv2.imread(str(illum_seq / "4.ppm"))  # Use image 4 for visible change
+    illum_target = cv2.imread(str(illum_seq / "4.ppm"))  
     
     if illum_ref is not None and illum_target is not None:
-        # Resize for paper (max 400px width)
         scale = min(400 / illum_ref.shape[1], 300 / illum_ref.shape[0])
         new_size = (int(illum_ref.shape[1] * scale), int(illum_ref.shape[0] * scale))
         
@@ -185,7 +154,6 @@ def extract_domain_examples(hpatches_root: Path, output_dir: Path):
         cv2.imwrite(str(output_dir / "illum_target.png"), illum_target_resized)
         print(f"✓ Saved: illum_ref.png, illum_target.png")
     
-    # Load and save viewpoint images
     view_ref = cv2.imread(str(view_seq / "1.ppm"))
     view_target = cv2.imread(str(view_seq / "4.ppm"))
     
@@ -202,9 +170,6 @@ def extract_domain_examples(hpatches_root: Path, output_dir: Path):
 
 
 def create_placeholder_domain_images(output_dir: Path):
-    """Create placeholder images if HPatches is not available."""
-    
-    # Create simple placeholder images with text
     fig, ax = plt.subplots(figsize=(4, 3))
     ax.text(0.5, 0.5, 'Illumination\nReference', ha='center', va='center', fontsize=14)
     ax.set_xlim(0, 1)
@@ -259,10 +224,8 @@ def main():
     print("Generating Paper Figures")
     print("="*50)
     
-    # 1. Create methodology figure
     create_methodology_figure(output_dir)
     
-    # 2. Create domain example images
     if args.hpatches and Path(args.hpatches).exists():
         extract_domain_examples(Path(args.hpatches), output_dir)
     else:

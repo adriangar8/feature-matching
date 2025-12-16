@@ -1,15 +1,9 @@
-"""
-Traditional descriptor extractors (SIFT, ORB, BRISK).
-"""
-
 from typing import Optional
 import numpy as np
 import cv2
 
 
-class TraditionalExtractor:
-    """Extract traditional descriptors (SIFT, ORB, BRISK)."""
-    
+class TraditionalExtractor:    
     def __init__(self, method: str):
         self.method = method.lower()
         

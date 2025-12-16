@@ -1,19 +1,11 @@
-#!/usr/bin/env python3
-"""
-Simplified benchmark runner script.
-All logic has been refactored into modular components in src/.
-"""
-
 import argparse
 import yaml
 import sys
 from pathlib import Path
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.runner.benchmark_runner import run_benchmark
-
 
 def main():
     parser = argparse.ArgumentParser(description="Feature Matching Benchmark (Final)")
@@ -23,7 +15,6 @@ def main():
     parser.add_argument("--output_dir", type=str, help="Output directory")
     args = parser.parse_args()
     
-    # Default config (no MAML)
     config = {
         "hpatches_root": "dataset/hpatches",
         "seed": 42,
@@ -48,7 +39,6 @@ def main():
         with open(args.config) as f:
             loaded = yaml.safe_load(f)
             if loaded:
-                # Remove MAML if present
                 loaded.pop("eval_maml", None)
                 config.update(loaded)
     

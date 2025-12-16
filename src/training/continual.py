@@ -1,7 +1,3 @@
-"""
-Continual learning methods (Naive, EWC, LwF).
-"""
-
 from typing import List, Tuple
 import torch
 import torch.nn as nn

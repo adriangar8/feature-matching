@@ -1,7 +1,3 @@
-"""
-Matching comparison visualizer for SIFT vs Learned descriptors.
-"""
-
 from pathlib import Path
 from typing import List, Optional, Tuple
 import numpy as np
@@ -14,24 +10,17 @@ from matplotlib.gridspec import GridSpec
 
 from ..utils.preprocessing import normalize_patch
 
-class MatchingComparisonVisualizer:
-    """
-    Create side-by-side qualitative comparisons of SIFT vs Learned descriptors.
-    Shows the same query on both methods and their top matches.
-    """
-    
+class MatchingComparisonVisualizer:    
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Colors
-        self.query_color = (155, 89, 182)      # Purple (BGR)
-        self.correct_color = (96, 174, 39)     # Green (BGR)
-        self.wrong_color = (34, 126, 230)      # Orange (BGR)
-        self.distractor_color = (180, 180, 180)  # Gray (BGR)
+        self.query_color = (155, 89, 182)      
+        self.correct_color = (96, 174, 39)     
+        self.wrong_color = (34, 126, 230)      
+        self.distractor_color = (180, 180, 180)
     
     def extract_sift_descriptor(self, patch: np.ndarray) -> Optional[np.ndarray]:
-        """Extract SIFT descriptor from a patch."""
         sift = cv2.SIFT_create() # type: ignore
         
         if patch.max() <= 1.0:
@@ -57,7 +46,6 @@ class MatchingComparisonVisualizer:
         patch: np.ndarray, 
         device: str
     ) -> np.ndarray:
-        """Extract learned descriptor from a patch."""
         model.eval()
         normalized = normalize_patch(patch)
         tensor = torch.from_numpy(normalized).unsqueeze(0).to(device)
@@ -75,20 +63,15 @@ class MatchingComparisonVisualizer:
         distractor_descs: List[np.ndarray],
         use_cosine: bool = True
     ) -> Tuple[int, List[int], List[float]]:
-        """
-        Compute ranking of correct match among distractors.
-        Returns: (rank_of_correct, sorted_indices, distances)
-        """
+
         all_descs = [correct_desc] + distractor_descs
         
         if use_cosine:
-            # Cosine distance (1 - similarity)
             distances = []
             for desc in all_descs:
                 sim = np.dot(query_desc, desc) / (np.linalg.norm(query_desc) * np.linalg.norm(desc) + 1e-8)
                 distances.append(1 - sim)
         else:
-            # L2 distance
             distances = [np.linalg.norm(query_desc - desc) for desc in all_descs]
         
         sorted_indices = np.argsort(distances)
@@ -112,35 +95,22 @@ class MatchingComparisonVisualizer:
         save_path: Path,
         model_name: str = "ResNet50"
     ):
-        """
-        Create a figure comparing SIFT vs Learned matching on the same image pair.
-        
-        Layout:
-        - Row 1: Query image (shared)
-        - Row 2: SIFT results on target image
-        - Row 3: Learned results on target image
-        """
         
         fig = plt.figure(figsize=(16, 14))
         gs = GridSpec(3, 2, figure=fig, height_ratios=[1, 1.2, 1.2], hspace=0.25, wspace=0.1)
         
-        # =====================================================================
-        # Row 1: Query Image
-        # =====================================================================
         ax_query = fig.add_subplot(gs[0, :])
         
         query_display = cv2.cvtColor(query_img, cv2.COLOR_GRAY2RGB) if len(query_img.shape) == 2 else query_img.copy()
         qx, qy = int(query_pos[0]), int(query_pos[1])
-        
-        # Draw query point
+
         cv2.circle(query_display, (qx, qy), 20, (155, 89, 182), 3)
         cv2.circle(query_display, (qx, qy), 8, (155, 89, 182), -1)
         
-        # Extract and show query patch
         half = 16
         if qy-half >= 0 and qy+half <= query_img.shape[0] and qx-half >= 0 and qx+half <= query_img.shape[1]:
             query_patch = query_img[qy-half:qy+half, qx-half:qx+half]
-            # Add patch inset
+
             ax_inset = ax_query.inset_axes([0.02, 0.65, 0.15, 0.3]) # type: ignore
             ax_inset.imshow(query_patch, cmap='gray')
             ax_inset.set_title('Query Patch', fontsize=10)
@@ -154,31 +124,25 @@ class MatchingComparisonVisualizer:
                           fontsize=14, fontweight='bold')
         ax_query.axis('off')
         
-        # =====================================================================
-        # Row 2: SIFT Results
-        # =====================================================================
         ax_sift = fig.add_subplot(gs[1, :])
         
         sift_display = cv2.cvtColor(target_img, cv2.COLOR_GRAY2RGB) if len(target_img.shape) == 2 else target_img.copy()
         mx, my = int(correct_pos[0]), int(correct_pos[1])
         
-        # Draw all distractors (faint)
         for dx, dy in distractor_positions[:50]:
             dxi, dyi = int(dx), int(dy)
             cv2.circle(sift_display, (dxi, dyi), 5, (200, 200, 200), 1)
         
-        # Draw SIFT top-5 predictions
         for i, (px, py) in enumerate(sift_top5_positions[:5]):
             pxi, pyi = int(px), int(py)
-            if i == 0:  # Top prediction
-                color = (96, 174, 39) if sift_rank == 1 else (34, 126, 230)  # Green if correct, orange if wrong
+            if i == 0:  
+                color = (96, 174, 39) if sift_rank == 1 else (34, 126, 230)  
                 cv2.circle(sift_display, (pxi, pyi), 18, color, 3)
                 cv2.putText(sift_display, "1", (pxi-6, pyi+6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             else:
                 cv2.circle(sift_display, (pxi, pyi), 12, (100, 100, 255), 2)
                 cv2.putText(sift_display, str(i+1), (pxi-6, pyi+5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 255), 2)
         
-        # Draw ground truth
         cv2.circle(sift_display, (mx, my), 22, (96, 174, 39), 3)
         cv2.circle(sift_display, (mx, my), 6, (96, 174, 39), -1)
         
@@ -189,24 +153,18 @@ class MatchingComparisonVisualizer:
         ax_sift.set_title(f'SIFT Matching Result: {sift_status}', fontsize=14, fontweight='bold', color=sift_color)
         ax_sift.axis('off')
         
-        # Legend for SIFT
         ax_sift.text(0.02, 0.98, '● Ground Truth (green)\\n○ Top-5 predictions (numbered)', 
                     transform=ax_sift.transAxes, fontsize=10, verticalalignment='top',
                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
-        # =====================================================================
-        # Row 3: Learned Results
-        # =====================================================================
         ax_learned = fig.add_subplot(gs[2, :])
         
         learned_display = cv2.cvtColor(target_img, cv2.COLOR_GRAY2RGB) if len(target_img.shape) == 2 else target_img.copy()
         
-        # Draw all distractors (faint)
         for dx, dy in distractor_positions[:50]:
             dxi, dyi = int(dx), int(dy)
             cv2.circle(learned_display, (dxi, dyi), 5, (200, 200, 200), 1)
         
-        # Draw Learned top-5 predictions
         for i, (px, py) in enumerate(learned_top5_positions[:5]):
             pxi, pyi = int(px), int(py)
             if i == 0:
@@ -217,7 +175,6 @@ class MatchingComparisonVisualizer:
                 cv2.circle(learned_display, (pxi, pyi), 12, (100, 100, 255), 2)
                 cv2.putText(learned_display, str(i+1), (pxi-6, pyi+5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 255), 2)
         
-        # Draw ground truth
         cv2.circle(learned_display, (mx, my), 22, (96, 174, 39), 3)
         cv2.circle(learned_display, (mx, my), 6, (96, 174, 39), -1)
         
@@ -240,16 +197,13 @@ class MatchingComparisonVisualizer:
     
     def generate_comparisons(
         self,
-        data_mgr,  # HPatchesManager
+        data_mgr,  
         model: nn.Module,
         device: str,
         n_examples: int = 5,
         max_distractors: int = 100,
         model_name: str = "ResNet50"
     ):
-        """
-        Generate comparison figures for multiple examples.
-        """
         
         print("\\nGenerating SIFT vs Learned matching comparisons...")
         
@@ -269,7 +223,6 @@ class MatchingComparisonVisualizer:
                 
                 ref_img = seq["ref"]
                 
-                # Use target image 3 (moderate transformation)
                 target = None
                 for t in seq["targets"]:
                     if t["idx"] == 3:
@@ -282,8 +235,7 @@ class MatchingComparisonVisualizer:
                 
                 target_img = target["image"]
                 H = target["H"]
-                
-                # Detect keypoints
+            
                 detector = cv2.SIFT_create(nfeatures=500) # type: ignore
                 kps_ref = detector.detect(ref_img)
                 kps_target = detector.detect(target_img)
@@ -293,7 +245,6 @@ class MatchingComparisonVisualizer:
                 
                 half = 16
                 
-                # Find a good query keypoint
                 for kp in kps_ref[:20]:
                     qx, qy = int(kp.pt[0]), int(kp.pt[1])
                     
@@ -302,7 +253,6 @@ class MatchingComparisonVisualizer:
                     
                     query_patch = ref_img[qy-half:qy+half, qx-half:qx+half].astype(np.float32) / 255.0
                     
-                    # Get ground truth position
                     pt_ref = np.array([[kp.pt[0], kp.pt[1]]], dtype=np.float32).reshape(-1, 1, 2)
                     pt_target = cv2.perspectiveTransform(pt_ref, H)[0, 0]
                     mx, my = int(pt_target[0]), int(pt_target[1])
@@ -312,7 +262,6 @@ class MatchingComparisonVisualizer:
                     
                     correct_patch = target_img[my-half:my+half, mx-half:mx+half].astype(np.float32) / 255.0
                     
-                    # Get distractor patches and positions
                     distractor_patches = []
                     distractor_positions = []
                     
@@ -336,9 +285,6 @@ class MatchingComparisonVisualizer:
                     if len(distractor_patches) < 20:
                         continue
                     
-                    # =========================================================
-                    # SIFT matching
-                    # =========================================================
                     sift_query = self.extract_sift_descriptor(query_patch)
                     sift_correct = self.extract_sift_descriptor(correct_patch)
                     sift_distractors = [self.extract_sift_descriptor(p) for p in distractor_patches]
@@ -351,7 +297,6 @@ class MatchingComparisonVisualizer:
                         sift_query, sift_correct, sift_distractors, use_cosine=True
                     )
                     
-                    # Get positions of SIFT top-5
                     sift_top5_positions = []
                     for idx in sift_sorted_idx[:5]:
                         if idx == 0:
@@ -359,9 +304,6 @@ class MatchingComparisonVisualizer:
                         else:
                             sift_top5_positions.append(distractor_positions[idx - 1])
                     
-                    # =========================================================
-                    # Learned matching
-                    # =========================================================
                     learned_query = self.extract_deep_descriptor(model, query_patch, device)
                     learned_correct = self.extract_deep_descriptor(model, correct_patch, device)
                     learned_distractors = [self.extract_deep_descriptor(model, p, device) for p in distractor_patches]
@@ -370,7 +312,6 @@ class MatchingComparisonVisualizer:
                         learned_query, learned_correct, learned_distractors, use_cosine=True
                     )
                     
-                    # Get positions of Learned top-5
                     learned_top5_positions = []
                     for idx in learned_sorted_idx[:5]:
                         if idx == 0:
@@ -378,9 +319,6 @@ class MatchingComparisonVisualizer:
                         else:
                             learned_top5_positions.append(distractor_positions[idx - 1])
                     
-                    # =========================================================
-                    # Create comparison figure
-                    # =========================================================
                     save_path = self.output_dir / f"matching_comparison_{domain}_{seq_name}_{examples_saved:02d}.png"
                     
                     self.create_comparison_figure(
@@ -400,6 +338,6 @@ class MatchingComparisonVisualizer:
                     )
                     
                     examples_saved += 1
-                    break  # One example per sequence
+                    break
         
         print(f"  Generated {examples_saved} comparison figures per domain")

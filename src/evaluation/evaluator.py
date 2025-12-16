@@ -1,7 +1,3 @@
-"""
-Evaluation functions for traditional and deep learning models.
-"""
-
 from typing import List, Optional
 import numpy as np
 import torch
@@ -105,7 +101,6 @@ def evaluate_deep(
     method_name: str = "deep",
     save_every: int = 20,
 ) -> EvalResult:
-    """Evaluate deep learning model with proper normalization."""
     model.eval()
     ranks = []
     

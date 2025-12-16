@@ -1,7 +1,3 @@
-"""
-T-SNE visualization for embedding analysis.
-"""
-
 from pathlib import Path
 from typing import Dict, List, Tuple
 import numpy as np
@@ -17,17 +13,14 @@ from sklearn.manifold import TSNE
 from ..data.structures import TSNESample
 from ..utils.preprocessing import normalize_patch
 
-class TSNEVisualizer:
-    """Create T-SNE visualizations for embedding analysis."""
-    
+class TSNEVisualizer:    
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Colors
-        self.query_color = '#9B59B6'      # Purple
-        self.match_color = '#27AE60'       # Green
-        self.distractor_color = '#E67E22'  # Orange
+        self.query_color = '#9B59B6'      
+        self.match_color = '#27AE60'      
+        self.distractor_color = '#E67E22' 
     
     def extract_embeddings_deep(
         self,
@@ -35,7 +28,6 @@ class TSNEVisualizer:
         sample: TSNESample,
         device: str
     ) -> np.ndarray:
-        """Extract embeddings using deep model."""
         model.eval()
         
         all_patches = [sample.query_patch, sample.correct_patch] + sample.distractor_patches
@@ -54,7 +46,6 @@ class TSNEVisualizer:
         return embeddings.cpu().numpy()
     
     def extract_embeddings_sift(self, sample: TSNESample) -> np.ndarray:
-        """Extract embeddings using SIFT."""
         sift = cv2.SIFT_create() # type: ignore
         embeddings = []
         
@@ -80,7 +71,6 @@ class TSNEVisualizer:
         return np.array(embeddings)
     
     def compute_tsne_2d(self, embeddings: np.ndarray, perplexity: int = 5) -> np.ndarray:
-        """Compute 2D T-SNE projection."""
         n_samples = embeddings.shape[0]
         perplexity = min(perplexity, n_samples - 1)
         
@@ -100,13 +90,11 @@ class TSNEVisualizer:
         model_name: str,
         save_path: Path
     ):
-        """Create 2D T-SNE with patch thumbnails."""
         
         fig, ax = plt.subplots(figsize=(12, 10))
         
         all_patches = [sample.query_patch, sample.correct_patch] + sample.distractor_patches
         
-        # Plot distractors
         for i in range(2, len(coords)):
             ax.scatter(
                 coords[i, 0], coords[i, 1],
@@ -114,7 +102,6 @@ class TSNEVisualizer:
                 marker='o', zorder=1
             )
         
-        # Plot correct match
         ax.scatter(
             coords[1, 0], coords[1, 1],
             c=self.match_color, s=300, alpha=1.0,
@@ -122,7 +109,6 @@ class TSNEVisualizer:
             label='Correct Match', zorder=2
         )
         
-        # Plot query
         ax.scatter(
             coords[0, 0], coords[0, 1],
             c=self.query_color, s=300, alpha=1.0,
@@ -130,14 +116,12 @@ class TSNEVisualizer:
             label='Query', zorder=3
         )
         
-        # Draw line from query to correct match
         ax.plot(
             [coords[0, 0], coords[1, 0]],
             [coords[0, 1], coords[1, 1]],
             'g--', linewidth=2, alpha=0.7, zorder=0
         )
         
-        # Add patch thumbnails
         def add_patch_thumbnail(patch, x, y, zoom=0.6, border_color='black'):
             if patch.max() <= 1.0:
                 patch_display = (patch * 255).astype(np.uint8)
@@ -154,11 +138,9 @@ class TSNEVisualizer:
             ab = AnnotationBbox(imagebox, (x, y), frameon=False, zorder=10)
             ax.add_artist(ab)
         
-        # Add thumbnails for query, match
         add_patch_thumbnail(all_patches[0], coords[0, 0], coords[0, 1], zoom=0.8)
         add_patch_thumbnail(all_patches[1], coords[1, 0], coords[1, 1], zoom=0.8)
         
-        # Add thumbnails for closest distractors
         if len(coords) > 4:
             distractor_coords = coords[2:]
             distractor_dists = [np.linalg.norm(coords[0] - c) for c in distractor_coords]
@@ -170,7 +152,6 @@ class TSNEVisualizer:
                 zoom=0.5
             )
         
-        # Compute metrics
         query_to_match = np.linalg.norm(coords[0] - coords[1])
         query_to_distractors = [np.linalg.norm(coords[0] - coords[i]) for i in range(2, len(coords))]
         min_distractor_dist = min(query_to_distractors) if query_to_distractors else float('inf')
@@ -183,7 +164,6 @@ class TSNEVisualizer:
         title += f'Sequence: {sample.seq_name}'
         ax.set_title(title, fontsize=14, fontweight='bold')
         
-        # Add metrics text box
         separation_ratio = min_distractor_dist / query_to_match if query_to_match > 0 else 0
         metrics_text = f'Query-Match dist: {query_to_match:.2f}\n'
         metrics_text += f'Query-Nearest Distractor: {min_distractor_dist:.2f}\n'
@@ -208,11 +188,9 @@ class TSNEVisualizer:
         model_name: str,
         save_path: Path
     ):
-        """Create figure showing global images with keypoint locations."""
         
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
         
-        # Query image
         query_img = cv2.cvtColor(sample.query_global_img, cv2.COLOR_GRAY2RGB)
         qx, qy = int(sample.query_pos[0]), int(sample.query_pos[1])
         cv2.circle(query_img, (qx, qy), 15, (155, 89, 182), 3)
@@ -222,7 +200,6 @@ class TSNEVisualizer:
         axes[0].set_title('Query Image', fontsize=12, fontweight='bold')
         axes[0].axis('off')
         
-        # Match image
         match_img = cv2.cvtColor(sample.match_global_img, cv2.COLOR_GRAY2RGB)
         mx, my = int(sample.match_pos[0]), int(sample.match_pos[1])
         cv2.circle(match_img, (mx, my), 15, (39, 174, 96), 3)
@@ -250,14 +227,13 @@ class TSNEVisualizer:
     def create_combined_tsne_figure(
         self,
         samples: List[TSNESample],
-        models: Dict[str, Tuple[nn.Module, str]],  # name -> (model, type)
+        models: Dict[str, Tuple[nn.Module, str]], 
         device: str,
         save_path: Path
     ):
-        """Create combined T-SNE figure comparing all models."""
         
         n_models = len(models)
-        n_domains = 2  # illumination, viewpoint
+        n_domains = 2
         
         fig, axes = plt.subplots(n_domains, n_models, figsize=(5*n_models, 10))
         
@@ -275,16 +251,13 @@ class TSNEVisualizer:
                 
                 sample = domain_samples[0]
                 
-                # Extract embeddings
                 if model_type == "sift":
                     embeddings = self.extract_embeddings_sift(sample)
                 else:
                     embeddings = self.extract_embeddings_deep(model, sample, device)
                 
-                # Compute T-SNE
                 coords = self.compute_tsne_2d(embeddings)
                 
-                # Plot
                 for i in range(2, len(coords)):
                     ax.scatter(coords[i, 0], coords[i, 1], c=self.distractor_color, 
                               s=80, alpha=0.6, marker='o')
@@ -297,7 +270,6 @@ class TSNEVisualizer:
                 ax.plot([coords[0, 0], coords[1, 0]], [coords[0, 1], coords[1, 1]],
                        'g--', linewidth=2, alpha=0.7)
                 
-                # Metrics
                 query_to_match = np.linalg.norm(coords[0] - coords[1])
                 query_to_distractors = [np.linalg.norm(coords[0] - coords[i]) for i in range(2, len(coords))]
                 min_dist = min(query_to_distractors) if query_to_distractors else 0
@@ -306,7 +278,6 @@ class TSNEVisualizer:
                 ax.set_title(f'{model_name}\n{domain_name} (sep={sep_ratio:.1f}x)', fontsize=11)
                 ax.grid(True, alpha=0.3)
         
-        # Legend
         legend_elements = [
             mpatches.Patch(facecolor=self.query_color, label='Query'),
             mpatches.Patch(facecolor=self.match_color, label='Correct Match'),

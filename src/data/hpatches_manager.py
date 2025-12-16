@@ -1,7 +1,3 @@
-"""
-HPatches dataset manager for loading and processing image sequences.
-"""
-
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -12,9 +8,7 @@ from tqdm import tqdm
 from .structures import EvalPair, TSNESample
 
 
-class HPatchesManager:
-    """Manages HPatches dataset with proper train/test splits."""
-    
+class HPatchesManager:    
     def __init__(self, root: str, test_ratio: float = 0.2, seed: int = 42):
         self.root = Path(root)
         self.patch_size = 32
@@ -185,7 +179,6 @@ class HPatchesManager:
         min_negative_distance: float = 50.0,
         use_hardest_negative: bool = True,
     ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Create training triplets with HARD negatives."""
         triplets = []
         
         for seq_name in tqdm(sequences, desc="Creating triplets"):
@@ -274,7 +267,6 @@ class HPatchesManager:
         n_distractors: int = 10,
         target_idx: int = 3
     ) -> Optional[TSNESample]:
-        """Create a sample for T-SNE visualization."""
         try:
             seq = self.load_sequence(seq_name)
         except Exception:
@@ -282,7 +274,6 @@ class HPatchesManager:
         
         ref_img = seq["ref"]
         
-        # Find target with specified index
         target = None
         for t in seq["targets"]:
             if t["idx"] == target_idx:
@@ -306,7 +297,6 @@ class HPatchesManager:
         
         half = self.patch_size // 2
         
-        # Find a good query keypoint
         for kp in kps_ref:
             qx, qy = int(kp.pt[0]), int(kp.pt[1])
             
@@ -324,7 +314,6 @@ class HPatchesManager:
             
             correct_patch = target_img[my-half:my+half, mx-half:mx+half].astype(np.float32) / 255.0
             
-            # Find distractors
             distractor_patches = []
             distractor_positions = []
             

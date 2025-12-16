@@ -1,7 +1,3 @@
-"""
-Configuration utility functions.
-"""
-
 from typing import Dict
 
 

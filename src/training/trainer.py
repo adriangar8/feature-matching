@@ -1,7 +1,3 @@
-"""
-Training function for deep learning models.
-"""
-
 from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
@@ -24,7 +20,6 @@ def train_model(
     log_prefix: str = "",
     val_pairs: Optional[List[EvalPair]] = None,
 ) -> nn.Module:
-    """Training with proper normalization, augmentation, and stability."""
     
     dataset = TripletDataset(triplets, augment=True)
     loader = torch.utils.data.DataLoader(
@@ -107,7 +102,6 @@ def train_model(
                 f"{log_prefix}_nonzero_ratio": nonzero_ratio,
             })
         
-        # Validation
         if val_pairs is not None and (epoch + 1) % 5 == 0:
             val_result = evaluate_deep(model, val_pairs[:500], device, max_distractors=50)
             print(f"    Val: Acc = {val_result.accuracy:.4f}, Top-5 = {val_result.accuracy_top5:.4f}")
@@ -116,7 +110,6 @@ def train_model(
                 best_val_acc = val_result.accuracy
                 best_model_state = deepcopy(model.state_dict())
         
-        # Collapse warning
         if epoch >= 2 and nonzero_ratio < 0.01:
             print(f"  WARNING: Model may be collapsing!")
     

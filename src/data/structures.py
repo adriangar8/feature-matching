@@ -1,15 +1,9 @@
-"""
-Data structures for evaluation and visualization.
-"""
-
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import numpy as np
 
-
 @dataclass
 class EvalPair:
-    """A single evaluation pair."""
     query: np.ndarray
     correct_match: np.ndarray
     distractors: List[np.ndarray]
@@ -33,7 +27,6 @@ class EvalResult:
 
 @dataclass 
 class TSNESample:
-    """Sample for T-SNE visualization."""
     query_patch: np.ndarray
     correct_patch: np.ndarray
     distractor_patches: List[np.ndarray]

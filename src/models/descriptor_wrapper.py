@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-from typing import Optional
 
 class DescriptorModel(nn.Module):
     def __init__(
