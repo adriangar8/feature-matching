@@ -1,0 +1,2377 @@
+
+import argparse
+import yaml
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import cv2
+import random
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict
+from tqdm import tqdm
+from copy import deepcopy
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+import matplotlib.patches as mpatches
+from sklearn.manifold import TSNE
+import wandb
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.models.descriptor_wrapper import get_descriptor_model
+from src.utils.visualization import PatchVisualizer
+
+# ============================================================================
+# ImageNet normalization constants
+# ============================================================================
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def normalize_patch(patch: np.ndarray) -> np.ndarray:
+    """Normalize a grayscale patch for ImageNet-pretrained model."""
+    if patch.max() > 1.0:
+        patch = patch / 255.0
+    rgb = np.stack([patch, patch, patch], axis=-1)
+    rgb = (rgb - IMAGENET_MEAN) / IMAGENET_STD
+    return rgb.transpose(2, 0, 1).astype(np.float32)
+
+
+def augment_patch(patch: np.ndarray) -> np.ndarray:
+    """Apply data augmentation to a patch."""
+    if random.random() < 0.5:
+        delta = random.uniform(-0.2, 0.2)
+        patch = np.clip(patch + delta, 0, 1)
+    
+    if random.random() < 0.5:
+        factor = random.uniform(0.7, 1.3)
+        mean = patch.mean()
+        patch = np.clip((patch - mean) * factor + mean, 0, 1)
+    
+    if random.random() < 0.3:
+        noise = np.random.normal(0, 0.02, patch.shape).astype(np.float32)
+        patch = np.clip(patch + noise, 0, 1)
+    
+    if random.random() < 0.3:
+        angle = random.uniform(-15, 15)
+        h, w = patch.shape
+        M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
+        patch = cv2.warpAffine(patch, M, (w, h), borderMode=cv2.BORDER_REFLECT)
+    
+    if random.random() < 0.5:
+        patch = np.fliplr(patch).copy()
+    
+    return patch
+
+
+# ============================================================================
+# Data structures
+# ============================================================================
+
+@dataclass
+class EvalPair:
+    """A single evaluation pair."""
+    query: np.ndarray
+    correct_match: np.ndarray
+    distractors: List[np.ndarray]
+    seq_name: str
+    query_image_path: Optional[str] = None
+    match_image_path: Optional[str] = None
+    query_keypoint_pos: Optional[Tuple[float, float]] = None
+    match_keypoint_pos: Optional[Tuple[float, float]] = None
+
+
+@dataclass
+class EvalResult:
+    accuracy: float
+    accuracy_top5: float
+    accuracy_top10: float
+    mean_rank: float
+    median_rank: float
+    num_queries: int
+    num_candidates: int
+
+
+@dataclass 
+class TSNESample:
+    """Sample for T-SNE visualization."""
+    query_patch: np.ndarray
+    correct_patch: np.ndarray
+    distractor_patches: List[np.ndarray]
+    query_global_img: np.ndarray
+    match_global_img: np.ndarray
+    query_pos: Tuple[float, float]
+    match_pos: Tuple[float, float]
+    distractor_positions: List[Tuple[float, float]]
+    seq_name: str
+    domain: str
+
+
+class TripletDataset(torch.utils.data.Dataset):
+    """PyTorch dataset with proper normalization and augmentation."""
+    
+    def __init__(self, triplets: List[Tuple], augment: bool = True):
+        self.triplets = triplets
+        self.augment = augment
+    
+    def __len__(self):
+        return len(self.triplets)
+    
+    def __getitem__(self, idx):
+        anchor, positive, negative = self.triplets[idx]
+        
+        if self.augment:
+            if random.random() < 0.3:
+                anchor = augment_patch(anchor.copy())
+            positive = augment_patch(positive.copy())
+            negative = augment_patch(negative.copy())
+        
+        anchor_t = torch.from_numpy(normalize_patch(anchor))
+        positive_t = torch.from_numpy(normalize_patch(positive))
+        negative_t = torch.from_numpy(normalize_patch(negative))
+        
+        return anchor_t, positive_t, negative_t
+
+
+# ============================================================================
+# HPatchesManager
+# ============================================================================
+
+class HPatchesManager:
+    """Manages HPatches dataset with proper train/test splits."""
+    
+    def __init__(self, root: str, test_ratio: float = 0.2, seed: int = 42):
+        self.root = Path(root)
+        self.patch_size = 32
+        self.test_ratio = test_ratio
+        
+        if not self.root.exists():
+            raise ValueError(f"HPatches root not found: {root}")
+        
+        all_seqs = sorted([d.name for d in self.root.iterdir() if d.is_dir()])
+        self.illum_seqs = [s for s in all_seqs if s.startswith('i_')]
+        self.view_seqs = [s for s in all_seqs if s.startswith('v_')]
+        
+        if not self.illum_seqs and not self.view_seqs:
+            raise ValueError(f"No sequences found in {root}")
+        
+        rng = np.random.RandomState(seed)
+        
+        illum_shuffled = self.illum_seqs.copy()
+        view_shuffled = self.view_seqs.copy()
+        rng.shuffle(illum_shuffled)
+        rng.shuffle(view_shuffled)
+        
+        n_illum_test = max(1, int(len(self.illum_seqs) * test_ratio))
+        n_view_test = max(1, int(len(self.view_seqs) * test_ratio))
+        
+        self.splits = {
+            "illumination": {
+                "train": illum_shuffled[n_illum_test:],
+                "test": illum_shuffled[:n_illum_test],
+            },
+            "viewpoint": {
+                "train": view_shuffled[n_view_test:],
+                "test": view_shuffled[:n_view_test],
+            },
+        }
+        
+        self.detector = cv2.SIFT_create(nfeatures=500) # type: ignore
+        
+        print(f"HPatchesManager initialized from: {root}")
+        print(f"  Illumination: {len(self.splits['illumination']['train'])} train, "
+              f"{len(self.splits['illumination']['test'])} test")
+        print(f"  Viewpoint: {len(self.splits['viewpoint']['train'])} train, "
+              f"{len(self.splits['viewpoint']['test'])} test")
+    
+    def get_sequences(self, domain: str, split: str) -> List[str]:
+        if domain == "both":
+            return (self.splits["illumination"][split] + 
+                    self.splits["viewpoint"][split])
+        return self.splits[domain][split]
+    
+    def load_sequence(self, seq_name: str) -> Dict:
+        seq_dir = self.root / seq_name
+        
+        ref_img = cv2.imread(str(seq_dir / "1.ppm"), cv2.IMREAD_GRAYSCALE)
+        if ref_img is None:
+            raise ValueError(f"Could not load reference image from {seq_dir}")
+        
+        targets = []
+        for i in range(2, 7):
+            img_path = seq_dir / f"{i}.ppm"
+            h_path = seq_dir / f"H_1_{i}"
+            
+            if img_path.exists() and h_path.exists():
+                img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+                H = np.loadtxt(str(h_path))
+                targets.append({"image": img, "H": H, "idx": i})
+        
+        return {"ref": ref_img, "targets": targets, "name": seq_name}
+    
+    def extract_patch(self, img: np.ndarray, x: float, y: float) -> Optional[np.ndarray]:
+        h, w = img.shape[:2]
+        half = self.patch_size // 2
+        
+        xi, yi = int(round(x)), int(round(y))
+        
+        if xi - half < 0 or xi + half > w or yi - half < 0 or yi + half > h:
+            return None
+        
+        patch = img[yi - half:yi + half, xi - half:xi + half]
+        
+        if patch.shape != (self.patch_size, self.patch_size):
+            return None
+        
+        return patch.astype(np.float32) / 255.0
+    
+    def create_eval_pairs(
+        self,
+        sequences: List[str],
+        max_pairs_per_seq: int = 100,
+        min_distractors: int = 20,
+    ) -> List[EvalPair]:
+        eval_pairs = []
+        
+        for seq_name in tqdm(sequences, desc="Creating eval pairs"):
+            try:
+                seq = self.load_sequence(seq_name)
+            except Exception as e:
+                print(f"Warning: Could not load {seq_name}: {e}")
+                continue
+                
+            ref_img = seq["ref"]
+            kps_ref = self.detector.detect(ref_img)
+            if len(kps_ref) < 10:
+                continue
+            
+            for target in seq["targets"]:
+                target_img = target["image"]
+                H = target["H"]
+                target_idx = target["idx"]
+                
+                kps_target = self.detector.detect(target_img)
+                
+                all_target_patches = []
+                all_target_pts = []
+                for kp in kps_target:
+                    patch = self.extract_patch(target_img, kp.pt[0], kp.pt[1])
+                    if patch is not None:
+                        all_target_patches.append(patch)
+                        all_target_pts.append(kp.pt)
+                
+                if len(all_target_patches) < min_distractors:
+                    continue
+                
+                pairs_added = 0
+                for kp in kps_ref:
+                    if pairs_added >= max_pairs_per_seq:
+                        break
+                    
+                    query = self.extract_patch(ref_img, kp.pt[0], kp.pt[1])
+                    if query is None:
+                        continue
+                    
+                    pt_ref = np.array([[kp.pt[0], kp.pt[1]]], dtype=np.float32).reshape(-1, 1, 2)
+                    pt_target = cv2.perspectiveTransform(pt_ref, H)[0, 0]
+                    
+                    correct = self.extract_patch(target_img, pt_target[0], pt_target[1])
+                    if correct is None:
+                        continue
+                    
+                    distractors = []
+                    for patch, pt in zip(all_target_patches, all_target_pts):
+                        dist = np.sqrt((pt[0] - pt_target[0])**2 + (pt[1] - pt_target[1])**2)
+                        if dist > 10:
+                            distractors.append(patch)
+                    
+                    if len(distractors) < min_distractors:
+                        continue
+                    
+                    eval_pairs.append(EvalPair(
+                        query=query,
+                        correct_match=correct,
+                        distractors=distractors,
+                        seq_name=seq_name,
+                        query_image_path=str(self.root / seq_name / "1.ppm"),
+                        match_image_path=str(self.root / seq_name / f"{target_idx}.ppm"),
+                        query_keypoint_pos=(kp.pt[0], kp.pt[1]),
+                        match_keypoint_pos=(pt_target[0], pt_target[1]),
+                    ))
+                    pairs_added += 1
+        
+        print(f"Created {len(eval_pairs)} evaluation pairs")
+        return eval_pairs
+    
+    def create_training_triplets(
+        self,
+        sequences: List[str],
+        max_triplets: int = 10000,
+        min_negative_distance: float = 50.0,
+        use_hardest_negative: bool = True,
+    ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Create training triplets with HARD negatives."""
+        triplets = []
+        
+        for seq_name in tqdm(sequences, desc="Creating triplets"):
+            if len(triplets) >= max_triplets:
+                break
+            
+            try:
+                seq = self.load_sequence(seq_name)
+            except Exception:
+                continue
+                
+            ref_img = seq["ref"]
+            kps_ref = self.detector.detect(ref_img)
+            
+            if len(kps_ref) < 20:
+                continue
+            
+            for target in seq["targets"]:
+                if len(triplets) >= max_triplets:
+                    break
+                
+                target_img = target["image"]
+                H = target["H"]
+                
+                valid_kps = []
+                for kp in kps_ref:
+                    anchor = self.extract_patch(ref_img, kp.pt[0], kp.pt[1])
+                    if anchor is None:
+                        continue
+                    
+                    pt_target = cv2.perspectiveTransform(
+                        np.array([[kp.pt]], dtype=np.float32), H
+                    )[0, 0]
+                    
+                    positive = self.extract_patch(target_img, pt_target[0], pt_target[1])
+                    if positive is None:
+                        continue
+                    
+                    valid_kps.append({
+                        "anchor": anchor,
+                        "positive": positive,
+                        "pt_target": pt_target,
+                    })
+                
+                if len(valid_kps) < 10:
+                    continue
+                
+                for i, kp_data in enumerate(valid_kps):
+                    if len(triplets) >= max_triplets:
+                        break
+                    
+                    valid_negatives = []
+                    for j in range(len(valid_kps)):
+                        if i == j:
+                            continue
+                        
+                        dist = np.sqrt(
+                            (valid_kps[i]["pt_target"][0] - valid_kps[j]["pt_target"][0])**2 +
+                            (valid_kps[i]["pt_target"][1] - valid_kps[j]["pt_target"][1])**2
+                        )
+                        
+                        if dist > min_negative_distance:
+                            valid_negatives.append((j, dist))
+                    
+                    if not valid_negatives:
+                        continue
+                    
+                    if use_hardest_negative:
+                        valid_negatives.sort(key=lambda x: x[1])
+                        neg_idx = valid_negatives[0][0]
+                    else:
+                        neg_idx = random.choice(valid_negatives)[0]
+                    
+                    triplets.append((
+                        kp_data["anchor"],
+                        kp_data["positive"],
+                        valid_kps[neg_idx]["positive"],
+                    ))
+        
+        print(f"Created {len(triplets)} training triplets")
+        return triplets
+    
+    def create_tsne_sample(
+        self,
+        seq_name: str,
+        n_distractors: int = 10,
+        target_idx: int = 3
+    ) -> Optional[TSNESample]:
+        """Create a sample for T-SNE visualization."""
+        try:
+            seq = self.load_sequence(seq_name)
+        except Exception:
+            return None
+        
+        ref_img = seq["ref"]
+        
+        # Find target with specified index
+        target = None
+        for t in seq["targets"]:
+            if t["idx"] == target_idx:
+                target = t
+                break
+        
+        if target is None:
+            target = seq["targets"][0] if seq["targets"] else None
+        
+        if target is None:
+            return None
+        
+        target_img = target["image"]
+        H = target["H"]
+        
+        kps_ref = self.detector.detect(ref_img)
+        kps_target = self.detector.detect(target_img)
+        
+        if len(kps_ref) < 5 or len(kps_target) < n_distractors + 5:
+            return None
+        
+        half = self.patch_size // 2
+        
+        # Find a good query keypoint
+        for kp in kps_ref:
+            qx, qy = int(kp.pt[0]), int(kp.pt[1])
+            
+            if qx - half < 0 or qx + half > ref_img.shape[1] or qy - half < 0 or qy + half > ref_img.shape[0]:
+                continue
+            
+            query_patch = ref_img[qy-half:qy+half, qx-half:qx+half].astype(np.float32) / 255.0
+            
+            pt_ref = np.array([[kp.pt[0], kp.pt[1]]], dtype=np.float32).reshape(-1, 1, 2)
+            pt_target = cv2.perspectiveTransform(pt_ref, H)[0, 0]
+            mx, my = int(pt_target[0]), int(pt_target[1])
+            
+            if mx - half < 0 or mx + half > target_img.shape[1] or my - half < 0 or my + half > target_img.shape[0]:
+                continue
+            
+            correct_patch = target_img[my-half:my+half, mx-half:mx+half].astype(np.float32) / 255.0
+            
+            # Find distractors
+            distractor_patches = []
+            distractor_positions = []
+            
+            for kp_t in kps_target:
+                dx, dy = int(kp_t.pt[0]), int(kp_t.pt[1])
+                
+                dist_to_match = np.sqrt((dx - mx)**2 + (dy - my)**2)
+                if dist_to_match < 30:
+                    continue
+                
+                if dx - half < 0 or dx + half > target_img.shape[1] or dy - half < 0 or dy + half > target_img.shape[0]:
+                    continue
+                
+                d_patch = target_img[dy-half:dy+half, dx-half:dx+half].astype(np.float32) / 255.0
+                distractor_patches.append(d_patch)
+                distractor_positions.append((kp_t.pt[0], kp_t.pt[1]))
+                
+                if len(distractor_patches) >= n_distractors:
+                    break
+            
+            if len(distractor_patches) < n_distractors:
+                continue
+            
+            domain = "illumination" if seq_name.startswith("i_") else "viewpoint"
+            
+            return TSNESample(
+                query_patch=query_patch,
+                correct_patch=correct_patch,
+                distractor_patches=distractor_patches,
+                query_global_img=ref_img,
+                match_global_img=target_img,
+                query_pos=(qx, qy),
+                match_pos=(mx, my),
+                distractor_positions=distractor_positions,
+                seq_name=seq_name,
+                domain=domain
+            )
+        
+        return None
+
+
+# ============================================================================
+# Utility functions
+# ============================================================================
+
+def get_float(config: Dict, key: str, default: float) -> float:
+    val = config.get(key, default)
+    return float(val) if val is not None else default
+
+
+def get_int(config: Dict, key: str, default: int) -> int:
+    val = config.get(key, default)
+    return int(float(val)) if val is not None else default
+
+
+def get_bool(config: Dict, key: str, default: bool) -> bool:
+    val = config.get(key, default)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.lower() in ('true', '1', 'yes')
+    return bool(val) if val is not None else default
+
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+# ============================================================================
+# Traditional Descriptors
+# ============================================================================
+
+class TraditionalExtractor:
+    def __init__(self, method: str):
+        self.method = method.lower()
+        
+        if self.method == "sift":
+            self.extractor = cv2.SIFT_create() # type: ignore
+            self.use_l2 = True
+        elif self.method == "orb":
+            self.extractor = cv2.ORB_create() # type: ignore
+            self.use_l2 = False
+        elif self.method == "brisk":
+            self.extractor = cv2.BRISK_create() # type: ignore
+            self.use_l2 = False
+        else:
+            raise ValueError(f"Unknown method: {method}")
+    
+    def extract(self, patch: np.ndarray) -> Optional[np.ndarray]:
+        if patch.max() <= 1.0:
+            patch = (patch * 255).astype(np.uint8)
+        else:
+            patch = patch.astype(np.uint8)
+        
+        h, w = patch.shape[:2]
+        if w < 64 or h < 64:
+            patch = cv2.resize(patch, (64, 64), interpolation=cv2.INTER_LINEAR)
+        
+        h, w = patch.shape[:2]
+        kp = cv2.KeyPoint(w / 2, h / 2, 16)
+        
+        try:
+            _, desc = self.extractor.compute(patch, [kp])
+            if desc is not None and len(desc) > 0:
+                return desc[0]
+        except Exception:
+            pass
+        return None
+    
+    def distance(self, d1: np.ndarray, d2: np.ndarray) -> float:
+        if self.use_l2:
+            d1 = d1.astype(np.float32)
+            d2 = d2.astype(np.float32)
+            d1 /= (np.linalg.norm(d1) + 1e-8)
+            d2 /= (np.linalg.norm(d2) + 1e-8)
+            return float(1 - np.dot(d1, d2))
+        else:
+            return float(cv2.norm(d1, d2, cv2.NORM_HAMMING))
+
+
+def evaluate_traditional(
+    method: str,
+    eval_pairs: List[EvalPair],
+    max_distractors: int = 100,
+    visualizer: Optional[PatchVisualizer] = None,
+    save_every: int = 20,
+    hpatches_root: str = None, # type: ignore
+) -> EvalResult:
+    extractor = TraditionalExtractor(method)
+    ranks = []
+    
+    for idx, pair in enumerate(tqdm(eval_pairs, desc=f"Eval {method}")):
+        query_desc = extractor.extract(pair.query)
+        if query_desc is None:
+            continue
+        
+        correct_desc = extractor.extract(pair.correct_match)
+        if correct_desc is None:
+            continue
+        
+        distractors = pair.distractors[:max_distractors]
+        distractor_descs = []
+        valid_distractors = []
+        for d in distractors:
+            desc = extractor.extract(d)
+            if desc is not None:
+                distractor_descs.append(desc)
+                valid_distractors.append(d)
+        
+        if len(distractor_descs) < 5:
+            continue
+        
+        distances = [extractor.distance(query_desc, correct_desc)]
+        for d_desc in distractor_descs:
+            distances.append(extractor.distance(query_desc, d_desc))
+        
+        sorted_idx = np.argsort(distances)
+        rank = int(np.where(sorted_idx == 0)[0][0]) + 1
+        ranks.append(rank)
+        
+        if visualizer is not None and idx % save_every == 0:
+            distractor_order = np.argsort(distances[1:])
+            sorted_distractors = [valid_distractors[i] for i in distractor_order[:10] if i < len(valid_distractors)]
+            
+            global_image_paths = None
+            query_pos = None
+            match_pos = None
+            
+            if pair.query_image_path and pair.match_image_path:
+                global_image_paths = (pair.query_image_path, pair.match_image_path)
+                query_pos = pair.query_keypoint_pos
+                match_pos = pair.match_keypoint_pos
+            
+            visualizer.add_example(
+                query=pair.query,
+                correct_match=pair.correct_match,
+                distractors=sorted_distractors,
+                distances=distances,
+                predicted_rank=rank,
+                seq_name=pair.seq_name,
+                method=method,
+                query_global_pos=query_pos,
+                match_global_pos=match_pos,
+                global_image_paths=global_image_paths,
+            )
+    
+    if not ranks:
+        return EvalResult(0, 0, 0, float('inf'), float('inf'), 0, 0)
+    
+    ranks = np.array(ranks)
+    return EvalResult(
+        accuracy=float(np.mean(ranks == 1)),
+        accuracy_top5=float(np.mean(ranks <= 5)),
+        accuracy_top10=float(np.mean(ranks <= 10)),
+        mean_rank=float(np.mean(ranks)),
+        median_rank=float(np.median(ranks)),
+        num_queries=len(ranks),
+        num_candidates=max_distractors + 1,
+    )
+
+
+# ============================================================================
+# Deep Learning Evaluation
+# ============================================================================
+
+def evaluate_deep(
+    model: nn.Module,
+    eval_pairs: List[EvalPair],
+    device: str = "cuda",
+    max_distractors: int = 100,
+    visualizer: Optional[PatchVisualizer] = None,
+    method_name: str = "deep",
+    save_every: int = 20,
+) -> EvalResult:
+    """Evaluate deep learning model with proper normalization."""
+    model.eval()
+    ranks = []
+    
+    for idx, pair in enumerate(tqdm(eval_pairs, desc=f"Eval {method_name}")):
+        distractors = pair.distractors[:max_distractors]
+        all_patches = [pair.query, pair.correct_match] + distractors
+        
+        tensors = []
+        for p in all_patches:
+            normalized = normalize_patch(p)
+            tensors.append(torch.from_numpy(normalized))
+        
+        batch = torch.stack(tensors).to(device)
+        
+        with torch.no_grad():
+            descs = model(batch)
+            descs = F.normalize(descs, p=2, dim=1)
+        
+        query_desc = descs[0:1]
+        candidate_descs = descs[1:]
+        
+        similarities = (query_desc @ candidate_descs.T).squeeze(0)
+        distances = (1 - similarities).cpu().numpy()
+        
+        sorted_idx = np.argsort(distances)
+        rank = int(np.where(sorted_idx == 0)[0][0]) + 1
+        ranks.append(rank)
+        
+        if visualizer is not None and idx % save_every == 0:
+            distractor_distances = distances[1:]
+            distractor_order = np.argsort(distractor_distances)
+            sorted_distractors = [distractors[i] for i in distractor_order[:10] if i < len(distractors)]
+            
+            global_image_paths = None
+            query_pos = None
+            match_pos = None
+            
+            if pair.query_image_path and pair.match_image_path:
+                global_image_paths = (pair.query_image_path, pair.match_image_path)
+                query_pos = pair.query_keypoint_pos
+                match_pos = pair.match_keypoint_pos
+            
+            visualizer.add_example(
+                query=pair.query,
+                correct_match=pair.correct_match,
+                distractors=sorted_distractors,
+                distances=distances.tolist(),
+                predicted_rank=rank,
+                seq_name=pair.seq_name,
+                method=method_name,
+                query_global_pos=query_pos,
+                match_global_pos=match_pos,
+                global_image_paths=global_image_paths,
+            )
+    
+    if not ranks:
+        return EvalResult(0, 0, 0, float('inf'), float('inf'), 0, 0)
+    
+    ranks = np.array(ranks)
+    return EvalResult(
+        accuracy=float(np.mean(ranks == 1)),
+        accuracy_top5=float(np.mean(ranks <= 5)),
+        accuracy_top10=float(np.mean(ranks <= 10)),
+        mean_rank=float(np.mean(ranks)),
+        median_rank=float(np.median(ranks)),
+        num_queries=len(ranks),
+        num_candidates=max_distractors + 1,
+    )
+
+
+# ============================================================================
+# Training Functions
+# ============================================================================
+
+def train_model(
+    model: nn.Module,
+    triplets: List[Tuple],
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: str,
+    log_prefix: str = "",
+    val_pairs: Optional[List[EvalPair]] = None,
+) -> nn.Module:
+    """Training with proper normalization, augmentation, and stability."""
+    
+    dataset = TripletDataset(triplets, augment=True)
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=True,
+        num_workers=4, pin_memory=True, drop_last=True,
+    )
+    
+    model = model.to(device)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    
+    num_training_steps = epochs * len(loader)
+    num_warmup_steps = min(500, num_training_steps // 10)
+    
+    def lr_lambda(step):
+        if step < num_warmup_steps:
+            return float(step) / float(max(1, num_warmup_steps))
+        return max(0.1, 1.0 - (step - num_warmup_steps) / (num_training_steps - num_warmup_steps))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    criterion = nn.TripletMarginLoss(margin=0.3, p=2)
+    
+    best_val_acc = 0
+    best_model_state = None
+    global_step = 0
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        num_batches = 0
+        num_nonzero_loss = 0
+        
+        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+        for anchor, positive, negative in pbar:
+            anchor = anchor.to(device)
+            positive = positive.to(device)
+            negative = negative.to(device)
+            
+            optimizer.zero_grad()
+            
+            d_a = model(anchor)
+            d_p = model(positive)
+            d_n = model(negative)
+            
+            loss = criterion(d_a, d_p, d_n)
+            
+            if loss.item() > 1e-6:
+                num_nonzero_loss += 1
+            
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            scheduler.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            global_step += 1
+            
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                nonzero=f"{num_nonzero_loss}/{num_batches}"
+            )
+            
+            if wandb.run is not None:
+                wandb.log({f"{log_prefix}_batch_loss": loss.item()})
+        
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0
+        nonzero_ratio = num_nonzero_loss / num_batches if num_batches > 0 else 0
+        
+        print(f"  Epoch {epoch+1}: loss = {avg_loss:.4f}, nonzero = {nonzero_ratio:.1%}, lr = {scheduler.get_last_lr()[0]:.2e}")
+        
+        if wandb.run is not None:
+            wandb.log({
+                f"{log_prefix}_epoch": epoch + 1,
+                f"{log_prefix}_epoch_loss": avg_loss,
+                f"{log_prefix}_nonzero_ratio": nonzero_ratio,
+            })
+        
+        # Validation
+        if val_pairs is not None and (epoch + 1) % 5 == 0:
+            val_result = evaluate_deep(model, val_pairs[:500], device, max_distractors=50)
+            print(f"    Val: Acc = {val_result.accuracy:.4f}, Top-5 = {val_result.accuracy_top5:.4f}")
+            
+            if val_result.accuracy > best_val_acc:
+                best_val_acc = val_result.accuracy
+                best_model_state = deepcopy(model.state_dict())
+        
+        # Collapse warning
+        if epoch >= 2 and nonzero_ratio < 0.01:
+            print(f"  WARNING: Model may be collapsing!")
+    
+    if best_model_state is not None:
+        print(f"  Loading best model (val_acc = {best_val_acc:.4f})")
+        model.load_state_dict(best_model_state)
+    
+    return model
+
+
+# ============================================================================
+# Continual Learning
+# ============================================================================
+
+class NaiveFinetuner:
+    def __init__(self, model: nn.Module, lr: float = 1e-4, device: str = "cuda"):
+        self.model = model
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        self.device = device
+    
+    def train_step(self, batch: Tuple[torch.Tensor, ...], criterion: nn.Module) -> float:
+        anchor, positive, negative = batch
+        anchor = anchor.to(self.device)
+        positive = positive.to(self.device)
+        negative = negative.to(self.device)
+        
+        self.optimizer.zero_grad()
+        
+        d_a = self.model(anchor)
+        d_p = self.model(positive)
+        d_n = self.model(negative)
+        
+        loss = criterion(d_a, d_p, d_n)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        
+        return loss.item()
+
+
+class EWC:
+    def __init__(self, model: nn.Module, lr: float = 1e-4, ewc_lambda: float = 400, device: str = "cuda"):
+        self.model = model
+        self.ewc_lambda = ewc_lambda
+        self.device = device
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        
+        self.fisher = {}
+        self.optimal_params = {}
+    
+    def compute_fisher(self, triplets: List[Tuple], criterion: nn.Module, num_samples: int = 500):
+        dataset = TripletDataset(triplets[:num_samples], augment=False)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+        
+        self.fisher = {
+            n: torch.zeros_like(p) 
+            for n, p in self.model.named_parameters() 
+            if p.requires_grad
+        }
+        
+        self.optimal_params = {
+            n: p.clone().detach() 
+            for n, p in self.model.named_parameters() 
+            if p.requires_grad
+        }
+        
+        self.model.eval()
+        
+        for anchor, positive, negative in loader:
+            anchor = anchor.to(self.device)
+            positive = positive.to(self.device)
+            negative = negative.to(self.device)
+            
+            self.model.zero_grad()
+            
+            d_a = self.model(anchor)
+            d_p = self.model(positive)
+            d_n = self.model(negative)
+            
+            loss = criterion(d_a, d_p, d_n)
+            loss.backward()
+            
+            for n, p in self.model.named_parameters():
+                if p.requires_grad and p.grad is not None:
+                    self.fisher[n] += p.grad.data.clone().pow(2)
+        
+        for n in self.fisher:
+            self.fisher[n] /= len(loader)
+    
+    def penalty(self) -> torch.Tensor:
+        loss = 0
+        for n, p in self.model.named_parameters():
+            if n in self.fisher:
+                loss += (self.fisher[n] * (p - self.optimal_params[n]).pow(2)).sum()
+        return self.ewc_lambda * loss # type: ignore
+    
+    def train_step(self, batch: Tuple[torch.Tensor, ...], criterion: nn.Module) -> float:
+        anchor, positive, negative = batch
+        anchor = anchor.to(self.device)
+        positive = positive.to(self.device)
+        negative = negative.to(self.device)
+        
+        self.optimizer.zero_grad()
+        
+        d_a = self.model(anchor)
+        d_p = self.model(positive)
+        d_n = self.model(negative)
+        
+        task_loss = criterion(d_a, d_p, d_n)
+        ewc_loss = self.penalty()
+        loss = task_loss + ewc_loss
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        
+        return loss.item()
+
+
+class LwF:
+    def __init__(self, model: nn.Module, lr: float = 1e-4, lwf_lambda: float = 1.0, device: str = "cuda"):
+        self.model = model
+        self.lwf_lambda = lwf_lambda
+        self.device = device
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        
+        self.old_model = None
+    
+    def consolidate(self):
+        self.old_model = deepcopy(self.model)
+        self.old_model.eval()
+        for p in self.old_model.parameters():
+            p.requires_grad = False
+    
+    def distillation_loss(self, inputs: torch.Tensor) -> torch.Tensor:
+        if self.old_model is None:
+            return torch.tensor(0.0, device=self.device)
+        
+        with torch.no_grad():
+            old_outputs = self.old_model(inputs)
+        new_outputs = self.model(inputs)
+        
+        old_norm = F.normalize(old_outputs, p=2, dim=1)
+        new_norm = F.normalize(new_outputs, p=2, dim=1)
+        
+        loss = 1 - (old_norm * new_norm).sum(dim=1).mean()
+        return self.lwf_lambda * loss
+    
+    def train_step(self, batch: Tuple[torch.Tensor, ...], criterion: nn.Module) -> float:
+        anchor, positive, negative = batch
+        anchor = anchor.to(self.device)
+        positive = positive.to(self.device)
+        negative = negative.to(self.device)
+        
+        self.optimizer.zero_grad()
+        
+        d_a = self.model(anchor)
+        d_p = self.model(positive)
+        d_n = self.model(negative)
+        
+        task_loss = criterion(d_a, d_p, d_n)
+        distill_loss = self.distillation_loss(anchor)
+        loss = task_loss + distill_loss
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        
+        return loss.item()
+
+
+def train_continual(
+    model: nn.Module,
+    source_triplets: List[Tuple],
+    target_triplets: List[Tuple],
+    method: str,
+    epochs_target: int,
+    batch_size: int,
+    lr: float,
+    device: str,
+    log_prefix: str = "",
+    ewc_lambda: float = 400,
+    lwf_lambda: float = 1.0,
+) -> nn.Module:
+    criterion = nn.TripletMarginLoss(margin=0.3)
+    
+    if method == "naive":
+        trainer = NaiveFinetuner(model, lr=lr, device=device)
+    elif method == "ewc":
+        trainer = EWC(model, lr=lr, ewc_lambda=ewc_lambda, device=device)
+        trainer.compute_fisher(source_triplets, criterion)
+    elif method == "lwf":
+        trainer = LwF(model, lr=lr, lwf_lambda=lwf_lambda, device=device)
+        trainer.consolidate()
+    else:
+        trainer = NaiveFinetuner(model, lr=lr, device=device)
+    
+    dataset = TripletDataset(target_triplets, augment=True)
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=True,
+        num_workers=4, pin_memory=True, drop_last=True,
+    )
+    
+    for epoch in range(epochs_target):
+        model.train()
+        total_loss = 0
+        num_batches = 0
+        
+        for batch in tqdm(loader, desc=f"Target {epoch+1}/{epochs_target}", leave=False):
+            loss = trainer.train_step(batch, criterion)
+            total_loss += loss
+            num_batches += 1
+            
+            if wandb.run is not None:
+                wandb.log({f"{log_prefix}_{method}_batch_loss": loss})
+        
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0
+        print(f"    Epoch {epoch+1}: loss = {avg_loss:.4f}")
+        
+        if wandb.run is not None:
+            wandb.log({
+                f"{log_prefix}_{method}_epoch": epoch + 1,
+                f"{log_prefix}_{method}_epoch_loss": avg_loss
+            })
+    
+    return model
+
+
+# ============================================================================
+# T-SNE Visualization
+# ============================================================================
+
+class TSNEVisualizer:
+    """Create T-SNE visualizations for embedding analysis."""
+    
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Colors
+        self.query_color = '#9B59B6'      # Purple
+        self.match_color = '#27AE60'       # Green
+        self.distractor_color = '#E67E22'  # Orange
+    
+    def extract_embeddings_deep(
+        self,
+        model: nn.Module,
+        sample: TSNESample,
+        device: str
+    ) -> np.ndarray:
+        """Extract embeddings using deep model."""
+        model.eval()
+        
+        all_patches = [sample.query_patch, sample.correct_patch] + sample.distractor_patches
+        
+        tensors = []
+        for p in all_patches:
+            normalized = normalize_patch(p)
+            tensors.append(torch.from_numpy(normalized))
+        
+        batch = torch.stack(tensors).to(device)
+        
+        with torch.no_grad():
+            embeddings = model(batch)
+            embeddings = F.normalize(embeddings, p=2, dim=1)
+        
+        return embeddings.cpu().numpy()
+    
+    def extract_embeddings_sift(self, sample: TSNESample) -> np.ndarray:
+        """Extract embeddings using SIFT."""
+        sift = cv2.SIFT_create() # type: ignore
+        embeddings = []
+        
+        all_patches = [sample.query_patch, sample.correct_patch] + sample.distractor_patches
+        
+        for patch in all_patches:
+            if patch.max() <= 1.0:
+                patch_uint8 = (patch * 255).astype(np.uint8)
+            else:
+                patch_uint8 = patch.astype(np.uint8)
+            
+            patch_resized = cv2.resize(patch_uint8, (64, 64))
+            h, w = patch_resized.shape[:2]
+            kp = cv2.KeyPoint(w/2, h/2, 16)
+            
+            _, desc = sift.compute(patch_resized, [kp])
+            if desc is not None:
+                desc = desc[0] / (np.linalg.norm(desc[0]) + 1e-8)
+                embeddings.append(desc)
+            else:
+                embeddings.append(np.zeros(128))
+        
+        return np.array(embeddings)
+    
+    def compute_tsne_2d(self, embeddings: np.ndarray, perplexity: int = 5) -> np.ndarray:
+        """Compute 2D T-SNE projection."""
+        n_samples = embeddings.shape[0]
+        perplexity = min(perplexity, n_samples - 1)
+        
+        tsne = TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            max_iter=1000,
+            random_state=42,
+            init='pca'
+        )
+        return tsne.fit_transform(embeddings)
+    
+    def create_tsne_figure(
+        self,
+        coords: np.ndarray,
+        sample: TSNESample,
+        model_name: str,
+        save_path: Path
+    ):
+        """Create 2D T-SNE with patch thumbnails."""
+        
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        all_patches = [sample.query_patch, sample.correct_patch] + sample.distractor_patches
+        
+        # Plot distractors
+        for i in range(2, len(coords)):
+            ax.scatter(
+                coords[i, 0], coords[i, 1],
+                c=self.distractor_color, s=150, alpha=0.6,
+                marker='o', zorder=1
+            )
+        
+        # Plot correct match
+        ax.scatter(
+            coords[1, 0], coords[1, 1],
+            c=self.match_color, s=300, alpha=1.0,
+            marker='s', edgecolors='black', linewidths=2,
+            label='Correct Match', zorder=2
+        )
+        
+        # Plot query
+        ax.scatter(
+            coords[0, 0], coords[0, 1],
+            c=self.query_color, s=300, alpha=1.0,
+            marker='^', edgecolors='black', linewidths=2,
+            label='Query', zorder=3
+        )
+        
+        # Draw line from query to correct match
+        ax.plot(
+            [coords[0, 0], coords[1, 0]],
+            [coords[0, 1], coords[1, 1]],
+            'g--', linewidth=2, alpha=0.7, zorder=0
+        )
+        
+        # Add patch thumbnails
+        def add_patch_thumbnail(patch, x, y, zoom=0.6, border_color='black'):
+            if patch.max() <= 1.0:
+                patch_display = (patch * 255).astype(np.uint8)
+            else:
+                patch_display = patch.astype(np.uint8)
+            
+            patch_display = cv2.copyMakeBorder(
+                patch_display, 2, 2, 2, 2,
+                cv2.BORDER_CONSTANT,
+                value=128
+            )
+            
+            imagebox = OffsetImage(patch_display, zoom=zoom, cmap='gray')
+            ab = AnnotationBbox(imagebox, (x, y), frameon=False, zorder=10)
+            ax.add_artist(ab)
+        
+        # Add thumbnails for query, match
+        add_patch_thumbnail(all_patches[0], coords[0, 0], coords[0, 1], zoom=0.8)
+        add_patch_thumbnail(all_patches[1], coords[1, 0], coords[1, 1], zoom=0.8)
+        
+        # Add thumbnails for closest distractors
+        if len(coords) > 4:
+            distractor_coords = coords[2:]
+            distractor_dists = [np.linalg.norm(coords[0] - c) for c in distractor_coords]
+            closest_idx = np.argmin(distractor_dists)
+            add_patch_thumbnail(
+                all_patches[2 + closest_idx],
+                distractor_coords[closest_idx, 0],
+                distractor_coords[closest_idx, 1],
+                zoom=0.5
+            )
+        
+        # Compute metrics
+        query_to_match = np.linalg.norm(coords[0] - coords[1])
+        query_to_distractors = [np.linalg.norm(coords[0] - coords[i]) for i in range(2, len(coords))]
+        min_distractor_dist = min(query_to_distractors) if query_to_distractors else float('inf')
+        mean_distractor_dist = np.mean(query_to_distractors) if query_to_distractors else 0
+        
+        ax.set_xlabel('T-SNE Dimension 1', fontsize=12)
+        ax.set_ylabel('T-SNE Dimension 2', fontsize=12)
+        
+        title = f'{model_name} Embedding Space - {sample.domain.capitalize()}\n'
+        title += f'Sequence: {sample.seq_name}'
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        
+        # Add metrics text box
+        separation_ratio = min_distractor_dist / query_to_match if query_to_match > 0 else 0
+        metrics_text = f'Query-Match dist: {query_to_match:.2f}\n'
+        metrics_text += f'Query-Nearest Distractor: {min_distractor_dist:.2f}\n'
+        metrics_text += f'Separation Ratio: {separation_ratio:.2f}x'
+        
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+        ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes, fontsize=11,
+                verticalalignment='top', bbox=props)
+        
+        ax.legend(loc='upper right', fontsize=11)
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  Saved T-SNE: {save_path}")
+    
+    def create_global_context_figure(
+        self,
+        sample: TSNESample,
+        model_name: str,
+        save_path: Path
+    ):
+        """Create figure showing global images with keypoint locations."""
+        
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        
+        # Query image
+        query_img = cv2.cvtColor(sample.query_global_img, cv2.COLOR_GRAY2RGB)
+        qx, qy = int(sample.query_pos[0]), int(sample.query_pos[1])
+        cv2.circle(query_img, (qx, qy), 15, (155, 89, 182), 3)
+        cv2.circle(query_img, (qx, qy), 5, (155, 89, 182), -1)
+        
+        axes[0].imshow(query_img)
+        axes[0].set_title('Query Image', fontsize=12, fontweight='bold')
+        axes[0].axis('off')
+        
+        # Match image
+        match_img = cv2.cvtColor(sample.match_global_img, cv2.COLOR_GRAY2RGB)
+        mx, my = int(sample.match_pos[0]), int(sample.match_pos[1])
+        cv2.circle(match_img, (mx, my), 15, (39, 174, 96), 3)
+        cv2.circle(match_img, (mx, my), 5, (39, 174, 96), -1)
+        
+        for dx, dy in sample.distractor_positions[:10]:
+            dxi, dyi = int(dx), int(dy)
+            cv2.circle(match_img, (dxi, dyi), 8, (230, 126, 34), 2)
+        
+        axes[1].imshow(match_img)
+        axes[1].set_title('Target Image (with distractors)', fontsize=12, fontweight='bold')
+        axes[1].axis('off')
+        
+        plt.suptitle(
+            f'{model_name} - {sample.domain.capitalize()} Domain\nSequence: {sample.seq_name}',
+            fontsize=14, fontweight='bold', y=1.02
+        )
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  Saved global context: {save_path}")
+    
+    def create_combined_tsne_figure(
+        self,
+        samples: List[TSNESample],
+        models: Dict[str, Tuple[nn.Module, str]],  # name -> (model, type)
+        device: str,
+        save_path: Path
+    ):
+        """Create combined T-SNE figure comparing all models."""
+        
+        n_models = len(models)
+        n_domains = 2  # illumination, viewpoint
+        
+        fig, axes = plt.subplots(n_domains, n_models, figsize=(5*n_models, 10))
+        
+        illum_samples = [s for s in samples if s.domain == "illumination"]
+        view_samples = [s for s in samples if s.domain == "viewpoint"]
+        
+        for col, (model_name, (model, model_type)) in enumerate(models.items()):
+            for row, (domain_samples, domain_name) in enumerate([(illum_samples, "Illumination"), (view_samples, "Viewpoint")]):
+                ax = axes[row, col] if n_models > 1 else axes[row]
+                
+                if not domain_samples:
+                    ax.text(0.5, 0.5, "No samples", ha='center', va='center')
+                    ax.set_title(f'{model_name}\n{domain_name}')
+                    continue
+                
+                sample = domain_samples[0]
+                
+                # Extract embeddings
+                if model_type == "sift":
+                    embeddings = self.extract_embeddings_sift(sample)
+                else:
+                    embeddings = self.extract_embeddings_deep(model, sample, device)
+                
+                # Compute T-SNE
+                coords = self.compute_tsne_2d(embeddings)
+                
+                # Plot
+                for i in range(2, len(coords)):
+                    ax.scatter(coords[i, 0], coords[i, 1], c=self.distractor_color, 
+                              s=80, alpha=0.6, marker='o')
+                
+                ax.scatter(coords[1, 0], coords[1, 1], c=self.match_color,
+                          s=200, marker='s', edgecolors='black', linewidths=2)
+                ax.scatter(coords[0, 0], coords[0, 1], c=self.query_color,
+                          s=200, marker='^', edgecolors='black', linewidths=2)
+                
+                ax.plot([coords[0, 0], coords[1, 0]], [coords[0, 1], coords[1, 1]],
+                       'g--', linewidth=2, alpha=0.7)
+                
+                # Metrics
+                query_to_match = np.linalg.norm(coords[0] - coords[1])
+                query_to_distractors = [np.linalg.norm(coords[0] - coords[i]) for i in range(2, len(coords))]
+                min_dist = min(query_to_distractors) if query_to_distractors else 0
+                sep_ratio = min_dist / query_to_match if query_to_match > 0 else 0
+                
+                ax.set_title(f'{model_name}\n{domain_name} (sep={sep_ratio:.1f}x)', fontsize=11)
+                ax.grid(True, alpha=0.3)
+        
+        # Legend
+        legend_elements = [
+            mpatches.Patch(facecolor=self.query_color, label='Query'),
+            mpatches.Patch(facecolor=self.match_color, label='Correct Match'),
+            mpatches.Patch(facecolor=self.distractor_color, label='Distractors'),
+        ]
+        fig.legend(handles=legend_elements, loc='lower center', ncol=3, fontsize=11)
+        
+        plt.suptitle('T-SNE Embedding Space Comparison', fontsize=14, fontweight='bold')
+        plt.tight_layout(rect=[0, 0.05, 1, 0.95]) # type: ignore
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Saved combined T-SNE: {save_path}")
+
+# ============================================================================
+# Qualitative Matching Comparison Visualization
+# ============================================================================
+
+class MatchingComparisonVisualizer:
+    """
+    Create side-by-side qualitative comparisons of SIFT vs Learned descriptors.
+    Shows the same query on both methods and their top matches.
+    """
+    
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Colors
+        self.query_color = (155, 89, 182)      # Purple (BGR)
+        self.correct_color = (96, 174, 39)     # Green (BGR)
+        self.wrong_color = (34, 126, 230)      # Orange (BGR)
+        self.distractor_color = (180, 180, 180)  # Gray (BGR)
+    
+    def extract_sift_descriptor(self, patch: np.ndarray) -> Optional[np.ndarray]:
+        """Extract SIFT descriptor from a patch."""
+        sift = cv2.SIFT_create() # type: ignore
+        
+        if patch.max() <= 1.0:
+            patch = (patch * 255).astype(np.uint8)
+        else:
+            patch = patch.astype(np.uint8)
+        
+        if patch.shape[0] < 64 or patch.shape[1] < 64:
+            patch = cv2.resize(patch, (64, 64))
+        
+        h, w = patch.shape[:2]
+        kp = cv2.KeyPoint(w/2, h/2, 16)
+        
+        _, desc = sift.compute(patch, [kp])
+        if desc is not None and len(desc) > 0:
+            desc = desc[0] / (np.linalg.norm(desc[0]) + 1e-8)
+            return desc
+        return None
+    
+    def extract_deep_descriptor(
+        self, 
+        model: nn.Module, 
+        patch: np.ndarray, 
+        device: str
+    ) -> np.ndarray:
+        """Extract learned descriptor from a patch."""
+        model.eval()
+        normalized = normalize_patch(patch)
+        tensor = torch.from_numpy(normalized).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            desc = model(tensor)
+            desc = F.normalize(desc, p=2, dim=1)
+        
+        return desc.cpu().numpy()[0]
+    
+    def compute_rankings(
+        self,
+        query_desc: np.ndarray,
+        correct_desc: np.ndarray,
+        distractor_descs: List[np.ndarray],
+        use_cosine: bool = True
+    ) -> Tuple[int, List[int], List[float]]:
+        """
+        Compute ranking of correct match among distractors.
+        Returns: (rank_of_correct, sorted_indices, distances)
+        """
+        all_descs = [correct_desc] + distractor_descs
+        
+        if use_cosine:
+            # Cosine distance (1 - similarity)
+            distances = []
+            for desc in all_descs:
+                sim = np.dot(query_desc, desc) / (np.linalg.norm(query_desc) * np.linalg.norm(desc) + 1e-8)
+                distances.append(1 - sim)
+        else:
+            # L2 distance
+            distances = [np.linalg.norm(query_desc - desc) for desc in all_descs]
+        
+        sorted_indices = np.argsort(distances)
+        rank = int(np.where(sorted_indices == 0)[0][0]) + 1
+        
+        return rank, sorted_indices.tolist(), distances # type: ignore
+    
+    def create_comparison_figure(
+        self,
+        query_img: np.ndarray,
+        target_img: np.ndarray,
+        query_pos: Tuple[float, float],
+        correct_pos: Tuple[float, float],
+        distractor_positions: List[Tuple[float, float]],
+        sift_rank: int,
+        sift_top5_positions: List[Tuple[float, float]],
+        learned_rank: int,
+        learned_top5_positions: List[Tuple[float, float]],
+        seq_name: str,
+        domain: str,
+        save_path: Path,
+        model_name: str = "ResNet50"
+    ):
+        """
+        Create a figure comparing SIFT vs Learned matching on the same image pair.
+        
+        Layout:
+        - Row 1: Query image (shared)
+        - Row 2: SIFT results on target image
+        - Row 3: Learned results on target image
+        """
+        
+        fig = plt.figure(figsize=(16, 14))
+        gs = GridSpec(3, 2, figure=fig, height_ratios=[1, 1.2, 1.2], hspace=0.25, wspace=0.1)
+        
+        # =====================================================================
+        # Row 1: Query Image
+        # =====================================================================
+        ax_query = fig.add_subplot(gs[0, :])
+        
+        query_display = cv2.cvtColor(query_img, cv2.COLOR_GRAY2RGB) if len(query_img.shape) == 2 else query_img.copy()
+        qx, qy = int(query_pos[0]), int(query_pos[1])
+        
+        # Draw query point
+        cv2.circle(query_display, (qx, qy), 20, (155, 89, 182), 3)
+        cv2.circle(query_display, (qx, qy), 8, (155, 89, 182), -1)
+        
+        # Extract and show query patch
+        half = 16
+        if qy-half >= 0 and qy+half <= query_img.shape[0] and qx-half >= 0 and qx+half <= query_img.shape[1]:
+            query_patch = query_img[qy-half:qy+half, qx-half:qx+half]
+            # Add patch inset
+            ax_inset = ax_query.inset_axes([0.02, 0.65, 0.15, 0.3]) # type: ignore
+            ax_inset.imshow(query_patch, cmap='gray')
+            ax_inset.set_title('Query Patch', fontsize=10)
+            ax_inset.axis('off')
+            for spine in ax_inset.spines.values():
+                spine.set_edgecolor('purple')
+                spine.set_linewidth(3)
+        
+        ax_query.imshow(cv2.cvtColor(query_display, cv2.COLOR_BGR2RGB))
+        ax_query.set_title(f'Query Image - {domain.capitalize()} Domain\\nSequence: {seq_name}', 
+                          fontsize=14, fontweight='bold')
+        ax_query.axis('off')
+        
+        # =====================================================================
+        # Row 2: SIFT Results
+        # =====================================================================
+        ax_sift = fig.add_subplot(gs[1, :])
+        
+        sift_display = cv2.cvtColor(target_img, cv2.COLOR_GRAY2RGB) if len(target_img.shape) == 2 else target_img.copy()
+        mx, my = int(correct_pos[0]), int(correct_pos[1])
+        
+        # Draw all distractors (faint)
+        for dx, dy in distractor_positions[:50]:
+            dxi, dyi = int(dx), int(dy)
+            cv2.circle(sift_display, (dxi, dyi), 5, (200, 200, 200), 1)
+        
+        # Draw SIFT top-5 predictions
+        for i, (px, py) in enumerate(sift_top5_positions[:5]):
+            pxi, pyi = int(px), int(py)
+            if i == 0:  # Top prediction
+                color = (96, 174, 39) if sift_rank == 1 else (34, 126, 230)  # Green if correct, orange if wrong
+                cv2.circle(sift_display, (pxi, pyi), 18, color, 3)
+                cv2.putText(sift_display, "1", (pxi-6, pyi+6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            else:
+                cv2.circle(sift_display, (pxi, pyi), 12, (100, 100, 255), 2)
+                cv2.putText(sift_display, str(i+1), (pxi-6, pyi+5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 255), 2)
+        
+        # Draw ground truth
+        cv2.circle(sift_display, (mx, my), 22, (96, 174, 39), 3)
+        cv2.circle(sift_display, (mx, my), 6, (96, 174, 39), -1)
+        
+        ax_sift.imshow(cv2.cvtColor(sift_display, cv2.COLOR_BGR2RGB))
+        
+        sift_status = "✓ CORRECT" if sift_rank == 1 else f"✗ Rank {sift_rank}"
+        sift_color = 'green' if sift_rank == 1 else 'red'
+        ax_sift.set_title(f'SIFT Matching Result: {sift_status}', fontsize=14, fontweight='bold', color=sift_color)
+        ax_sift.axis('off')
+        
+        # Legend for SIFT
+        ax_sift.text(0.02, 0.98, '● Ground Truth (green)\\n○ Top-5 predictions (numbered)', 
+                    transform=ax_sift.transAxes, fontsize=10, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        # =====================================================================
+        # Row 3: Learned Results
+        # =====================================================================
+        ax_learned = fig.add_subplot(gs[2, :])
+        
+        learned_display = cv2.cvtColor(target_img, cv2.COLOR_GRAY2RGB) if len(target_img.shape) == 2 else target_img.copy()
+        
+        # Draw all distractors (faint)
+        for dx, dy in distractor_positions[:50]:
+            dxi, dyi = int(dx), int(dy)
+            cv2.circle(learned_display, (dxi, dyi), 5, (200, 200, 200), 1)
+        
+        # Draw Learned top-5 predictions
+        for i, (px, py) in enumerate(learned_top5_positions[:5]):
+            pxi, pyi = int(px), int(py)
+            if i == 0:
+                color = (96, 174, 39) if learned_rank == 1 else (34, 126, 230)
+                cv2.circle(learned_display, (pxi, pyi), 18, color, 3)
+                cv2.putText(learned_display, "1", (pxi-6, pyi+6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            else:
+                cv2.circle(learned_display, (pxi, pyi), 12, (100, 100, 255), 2)
+                cv2.putText(learned_display, str(i+1), (pxi-6, pyi+5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 255), 2)
+        
+        # Draw ground truth
+        cv2.circle(learned_display, (mx, my), 22, (96, 174, 39), 3)
+        cv2.circle(learned_display, (mx, my), 6, (96, 174, 39), -1)
+        
+        ax_learned.imshow(cv2.cvtColor(learned_display, cv2.COLOR_BGR2RGB))
+        
+        learned_status = "✓ CORRECT" if learned_rank == 1 else f"✗ Rank {learned_rank}"
+        learned_color = 'green' if learned_rank == 1 else 'red'
+        ax_learned.set_title(f'{model_name} Matching Result: {learned_status}', fontsize=14, fontweight='bold', color=learned_color)
+        ax_learned.axis('off')
+        
+        ax_learned.text(0.02, 0.98, '● Ground Truth (green)\\n○ Top-5 predictions (numbered)', 
+                       transform=ax_learned.transAxes, fontsize=10, verticalalignment='top',
+                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close()
+        
+        print(f"  Saved matching comparison: {save_path}")
+    
+    def generate_comparisons(
+        self,
+        data_mgr,  # HPatchesManager
+        model: nn.Module,
+        device: str,
+        n_examples: int = 5,
+        max_distractors: int = 100,
+        model_name: str = "ResNet50"
+    ):
+        """
+        Generate comparison figures for multiple examples.
+        """
+        
+        print("\\nGenerating SIFT vs Learned matching comparisons...")
+        
+        for domain in ["illumination", "viewpoint"]:
+            test_seqs = data_mgr.get_sequences(domain, "test")[:3]
+            
+            examples_saved = 0
+            
+            for seq_name in test_seqs:
+                if examples_saved >= n_examples:
+                    break
+                
+                try:
+                    seq = data_mgr.load_sequence(seq_name)
+                except Exception:
+                    continue
+                
+                ref_img = seq["ref"]
+                
+                # Use target image 3 (moderate transformation)
+                target = None
+                for t in seq["targets"]:
+                    if t["idx"] == 3:
+                        target = t
+                        break
+                if target is None and seq["targets"]:
+                    target = seq["targets"][0]
+                if target is None:
+                    continue
+                
+                target_img = target["image"]
+                H = target["H"]
+                
+                # Detect keypoints
+                detector = cv2.SIFT_create(nfeatures=500) # type: ignore
+                kps_ref = detector.detect(ref_img)
+                kps_target = detector.detect(target_img)
+                
+                if len(kps_ref) < 10 or len(kps_target) < 20:
+                    continue
+                
+                half = 16
+                
+                # Find a good query keypoint
+                for kp in kps_ref[:20]:
+                    qx, qy = int(kp.pt[0]), int(kp.pt[1])
+                    
+                    if qy-half < 0 or qy+half > ref_img.shape[0] or qx-half < 0 or qx+half > ref_img.shape[1]:
+                        continue
+                    
+                    query_patch = ref_img[qy-half:qy+half, qx-half:qx+half].astype(np.float32) / 255.0
+                    
+                    # Get ground truth position
+                    pt_ref = np.array([[kp.pt[0], kp.pt[1]]], dtype=np.float32).reshape(-1, 1, 2)
+                    pt_target = cv2.perspectiveTransform(pt_ref, H)[0, 0]
+                    mx, my = int(pt_target[0]), int(pt_target[1])
+                    
+                    if my-half < 0 or my+half > target_img.shape[0] or mx-half < 0 or mx+half > target_img.shape[1]:
+                        continue
+                    
+                    correct_patch = target_img[my-half:my+half, mx-half:mx+half].astype(np.float32) / 255.0
+                    
+                    # Get distractor patches and positions
+                    distractor_patches = []
+                    distractor_positions = []
+                    
+                    for kp_t in kps_target:
+                        dx, dy = int(kp_t.pt[0]), int(kp_t.pt[1])
+                        
+                        dist_to_match = np.sqrt((dx - mx)**2 + (dy - my)**2)
+                        if dist_to_match < 15:
+                            continue
+                        
+                        if dy-half < 0 or dy+half > target_img.shape[0] or dx-half < 0 or dx+half > target_img.shape[1]:
+                            continue
+                        
+                        d_patch = target_img[dy-half:dy+half, dx-half:dx+half].astype(np.float32) / 255.0
+                        distractor_patches.append(d_patch)
+                        distractor_positions.append((kp_t.pt[0], kp_t.pt[1]))
+                        
+                        if len(distractor_patches) >= max_distractors:
+                            break
+                    
+                    if len(distractor_patches) < 20:
+                        continue
+                    
+                    # =========================================================
+                    # SIFT matching
+                    # =========================================================
+                    sift_query = self.extract_sift_descriptor(query_patch)
+                    sift_correct = self.extract_sift_descriptor(correct_patch)
+                    sift_distractors = [self.extract_sift_descriptor(p) for p in distractor_patches]
+                    sift_distractors = [d for d in sift_distractors if d is not None]
+                    
+                    if sift_query is None or sift_correct is None or len(sift_distractors) < 10:
+                        continue
+                    
+                    sift_rank, sift_sorted_idx, _ = self.compute_rankings(
+                        sift_query, sift_correct, sift_distractors, use_cosine=True
+                    )
+                    
+                    # Get positions of SIFT top-5
+                    sift_top5_positions = []
+                    for idx in sift_sorted_idx[:5]:
+                        if idx == 0:
+                            sift_top5_positions.append((mx, my))
+                        else:
+                            sift_top5_positions.append(distractor_positions[idx - 1])
+                    
+                    # =========================================================
+                    # Learned matching
+                    # =========================================================
+                    learned_query = self.extract_deep_descriptor(model, query_patch, device)
+                    learned_correct = self.extract_deep_descriptor(model, correct_patch, device)
+                    learned_distractors = [self.extract_deep_descriptor(model, p, device) for p in distractor_patches]
+                    
+                    learned_rank, learned_sorted_idx, _ = self.compute_rankings(
+                        learned_query, learned_correct, learned_distractors, use_cosine=True
+                    )
+                    
+                    # Get positions of Learned top-5
+                    learned_top5_positions = []
+                    for idx in learned_sorted_idx[:5]:
+                        if idx == 0:
+                            learned_top5_positions.append((mx, my))
+                        else:
+                            learned_top5_positions.append(distractor_positions[idx - 1])
+                    
+                    # =========================================================
+                    # Create comparison figure
+                    # =========================================================
+                    save_path = self.output_dir / f"matching_comparison_{domain}_{seq_name}_{examples_saved:02d}.png"
+                    
+                    self.create_comparison_figure(
+                        query_img=ref_img,
+                        target_img=target_img,
+                        query_pos=(qx, qy),
+                        correct_pos=(mx, my),
+                        distractor_positions=distractor_positions,
+                        sift_rank=sift_rank,
+                        sift_top5_positions=sift_top5_positions,
+                        learned_rank=learned_rank,
+                        learned_top5_positions=learned_top5_positions,
+                        seq_name=seq_name,
+                        domain=domain,
+                        save_path=save_path,
+                        model_name=model_name
+                    )
+                    
+                    examples_saved += 1
+                    break  # One example per sequence
+        
+        print(f"  Generated {examples_saved} comparison figures per domain")
+
+# ============================================================================
+# Paper Figures Generator
+# ============================================================================
+
+def create_methodology_figure(output_dir: Path):
+    """Create methodology diagram for paper."""
+    
+    fig = plt.figure(figsize=(14, 8))
+    gs = GridSpec(2, 3, figure=fig, height_ratios=[1, 1.2], hspace=0.3, wspace=0.3)
+    
+    # Colors
+    query_color = '#9B59B6'
+    match_color = '#27AE60'
+    distractor_color = '#E67E22'
+    
+    # Top row: Triplet sampling
+    ax_triplet = fig.add_subplot(gs[0, :])
+    ax_triplet.set_xlim(0, 10)
+    ax_triplet.set_ylim(0, 3)
+    ax_triplet.axis('off')
+    
+    # Draw anchor
+    anchor_rect = mpatches.FancyBboxPatch((0.5, 1), 1.5, 1.5, 
+                                           boxstyle="round,pad=0.05",
+                                           facecolor=query_color, alpha=0.3,
+                                           edgecolor=query_color, linewidth=2)
+    ax_triplet.add_patch(anchor_rect)
+    ax_triplet.text(1.25, 0.6, 'Anchor\n(Query)', ha='center', fontsize=11, fontweight='bold')
+    
+    # Draw positive
+    pos_rect = mpatches.FancyBboxPatch((3.5, 1), 1.5, 1.5,
+                                       boxstyle="round,pad=0.05",
+                                       facecolor=match_color, alpha=0.3,
+                                       edgecolor=match_color, linewidth=2)
+    ax_triplet.add_patch(pos_rect)
+    ax_triplet.text(4.25, 0.6, 'Positive\n(Match)', ha='center', fontsize=11, fontweight='bold')
+    
+    # Draw negative
+    neg_rect = mpatches.FancyBboxPatch((6.5, 1), 1.5, 1.5,
+                                       boxstyle="round,pad=0.05",
+                                       facecolor=distractor_color, alpha=0.3,
+                                       edgecolor=distractor_color, linewidth=2)
+    ax_triplet.add_patch(neg_rect)
+    ax_triplet.text(7.25, 0.6, 'Negative\n(Distractor)', ha='center', fontsize=11, fontweight='bold')
+    
+    # Arrows
+    ax_triplet.annotate('', xy=(3.4, 1.75), xytext=(2.1, 1.75),
+                       arrowprops=dict(arrowstyle='->', color=match_color, lw=2))
+    ax_triplet.text(2.75, 2.0, 'Pull\nCloser', ha='center', fontsize=10, color=match_color)
+    
+    ax_triplet.annotate('', xy=(6.4, 1.75), xytext=(5.1, 1.75),
+                       arrowprops=dict(arrowstyle='<->', color=distractor_color, lw=2))
+    ax_triplet.text(5.75, 2.0, 'Push\nApart', ha='center', fontsize=10, color=distractor_color)
+    
+    ax_triplet.set_title('Triplet Contrastive Learning: Learning Invariant Descriptors', 
+                        fontsize=14, fontweight='bold', pad=10)
+    
+    # Bottom row: Embedding space before/after
+    ax_before = fig.add_subplot(gs[1, 0])
+    ax_after = fig.add_subplot(gs[1, 1])
+    ax_loss = fig.add_subplot(gs[1, 2])
+    
+    # Before training
+    np.random.seed(42)
+    n_points = 15
+    before_query = np.array([0, 0])
+    before_pos = np.random.randn(2) * 0.8
+    before_neg = np.random.randn(n_points, 2) * 0.8
+    
+    ax_before.scatter(before_neg[:, 0], before_neg[:, 1], c=distractor_color, 
+                     s=80, alpha=0.6, label='Distractors')
+    ax_before.scatter(before_pos[0], before_pos[1], c=match_color, 
+                     s=150, marker='s', edgecolors='black', linewidths=2, label='Match')
+    ax_before.scatter(before_query[0], before_query[1], c=query_color, 
+                     s=150, marker='^', edgecolors='black', linewidths=2, label='Query')
+    
+    ax_before.set_xlim(-2, 2)
+    ax_before.set_ylim(-2, 2)
+    ax_before.set_title('Before Training', fontweight='bold')
+    ax_before.set_xlabel('Embedding Dim 1')
+    ax_before.set_ylabel('Embedding Dim 2')
+    ax_before.grid(True, alpha=0.3)
+    ax_before.legend(loc='upper right', fontsize=9)
+    
+    # After training
+    after_query = np.array([0, 0])
+    after_pos = np.array([0.2, 0.15])
+    angles = np.linspace(0, 2*np.pi, n_points, endpoint=False)
+    radii = 1.2 + np.random.rand(n_points) * 0.3
+    after_neg = np.stack([radii * np.cos(angles), radii * np.sin(angles)], axis=1)
+    
+    ax_after.scatter(after_neg[:, 0], after_neg[:, 1], c=distractor_color,
+                    s=80, alpha=0.6, label='Distractors')
+    ax_after.scatter(after_pos[0], after_pos[1], c=match_color,
+                    s=150, marker='s', edgecolors='black', linewidths=2, label='Match')
+    ax_after.scatter(after_query[0], after_query[1], c=query_color,
+                    s=150, marker='^', edgecolors='black', linewidths=2, label='Query')
+    
+    circle = plt.Circle((0, 0), 0.3, fill=False, color='gray', linestyle='--', linewidth=1.5) # type: ignore
+    ax_after.add_patch(circle)
+    
+    ax_after.set_xlim(-2, 2)
+    ax_after.set_ylim(-2, 2)
+    ax_after.set_title('After Training', fontweight='bold')
+    ax_after.set_xlabel('Embedding Dim 1')
+    ax_after.set_ylabel('Embedding Dim 2')
+    ax_after.grid(True, alpha=0.3)
+    ax_after.legend(loc='upper right', fontsize=9)
+    
+    # Loss function
+    ax_loss.text(0.5, 0.85, 'Triplet Loss:', ha='center', fontsize=12, fontweight='bold',
+                transform=ax_loss.transAxes)
+    ax_loss.text(0.5, 0.65, r'$\mathcal{L} = \max(0, d_+ - d_- + m)$', ha='center', fontsize=14,
+                transform=ax_loss.transAxes)
+    ax_loss.text(0.5, 0.45, 'where:', ha='center', fontsize=10, transform=ax_loss.transAxes)
+    ax_loss.text(0.5, 0.30, r'$d_+ = \|f(a) - f(p)\|^2$', ha='center', fontsize=10,
+                transform=ax_loss.transAxes, color=match_color)
+    ax_loss.text(0.5, 0.15, r'$d_- = \|f(a) - f(n)\|^2$', ha='center', fontsize=10,
+                transform=ax_loss.transAxes, color=distractor_color)
+    ax_loss.text(0.5, 0.02, r'$m = 0.3$ (margin)', ha='center', fontsize=10,
+                transform=ax_loss.transAxes, color='gray')
+    ax_loss.axis('off')
+    ax_loss.set_title('Objective Function', fontweight='bold')
+    
+    plt.tight_layout()
+    
+    save_path = output_dir / 'methodology_contrastive_learning.png'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    
+    print(f"Saved methodology figure: {save_path}")
+    return save_path
+
+
+# ============================================================================
+# Main Benchmark
+# ============================================================================
+
+def run_benchmark(config: Dict) -> Dict:
+    """Run the complete benchmark."""
+    
+    # Initialize visualizer
+    visualizer = PatchVisualizer(config.get("output_dir", "results/benchmark"))
+    
+    # Initialize wandb
+    wandb.init(project="meta-feature-matching-final", config=config)
+    
+    seed = get_int(config, "seed", 42)
+    set_seed(seed)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    hpatches_root = config.get("hpatches_root", "/Data/adrian.garcia/hpatches/hpatches")
+    
+    data_mgr = HPatchesManager(hpatches_root, test_ratio=0.2, seed=seed)
+    
+    all_results = {
+        "config": config,
+        "seed": seed,
+    }
+    
+    # Store models for T-SNE visualization
+    tsne_models = {}
+    
+    # =========================================================================
+    # Traditional Methods
+    # =========================================================================
+    if get_bool(config, "eval_traditional", True):
+        print("\n" + "="*70)
+        print("EVALUATING TRADITIONAL METHODS")
+        print("="*70)
+        
+        all_results["traditional"] = {}
+        
+        for domain in ["illumination", "viewpoint"]:
+            eval_pairs = data_mgr.create_eval_pairs(
+                data_mgr.get_sequences(domain, "test"), 
+                config.get("max_pairs_per_seq", 50)
+            )
+            
+            all_results["traditional"][domain] = {}
+            
+            for method in ["sift", "orb", "brisk"]:
+                print(f"\nEvaluating {method.upper()} on {domain}...")
+                result = evaluate_traditional(
+                    method, eval_pairs, 
+                    max_distractors=config.get("max_distractors", 100), 
+                    visualizer=visualizer, 
+                    save_every=20,
+                    hpatches_root=hpatches_root,
+                )
+                all_results["traditional"][domain][method] = asdict(result)
+                wandb.log({f"traditional_{method}_{domain}_accuracy": result.accuracy})
+                
+                print(f"  Accuracy: {result.accuracy:.4f}")
+                print(f"  Top-5 Accuracy: {result.accuracy_top5:.4f}")
+                print(f"  Mean Rank: {result.mean_rank:.2f}")
+        
+        # Add SIFT to T-SNE models
+        tsne_models["SIFT"] = (None, "sift")
+    
+    # =========================================================================
+    # Deep Learning Methods
+    # =========================================================================
+    if get_bool(config, "eval_deep", True):
+        print("\n" + "="*70)
+        print("EVALUATING DEEP LEARNING METHODS")
+        print("="*70)
+        
+        all_results["deep"] = {}
+        
+        for train_domain in ["illumination", "viewpoint"]:
+            print(f"\nTraining on {train_domain}...")
+            train_seqs = data_mgr.get_sequences(train_domain, "train")
+            triplets = data_mgr.create_training_triplets(
+                train_seqs, 
+                config.get("max_triplets", 10000),
+                min_negative_distance=50.0,
+                use_hardest_negative=True,
+            )
+            
+            val_seqs = data_mgr.get_sequences(train_domain, "test")
+            val_pairs = data_mgr.create_eval_pairs(val_seqs, max_pairs_per_seq=50)
+            
+            model = get_descriptor_model("resnet50")
+            model = train_model(
+                model, triplets,
+                epochs=get_int(config, "deep_epochs", 5),
+                batch_size=get_int(config, "batch_size", 64),
+                lr=get_float(config, "lr", 1e-4),
+                device=device,
+                log_prefix=f"deep_{train_domain}",
+                val_pairs=val_pairs,
+            )
+            
+            # Store for T-SNE
+            tsne_models[f"ResNet50 ({train_domain[:5].capitalize()})"] = (deepcopy(model), "deep")
+            
+            all_results["deep"][f"resnet50_{train_domain}"] = {}
+            
+            for eval_domain in ["illumination", "viewpoint"]:
+                print(f"\nEvaluating on {eval_domain}...")
+                eval_pairs = data_mgr.create_eval_pairs(
+                    data_mgr.get_sequences(eval_domain, "test"), 
+                    config.get("max_pairs_per_seq", 50)
+                )
+                result = evaluate_deep(
+                    model, eval_pairs, device, 
+                    max_distractors=config.get("max_distractors", 100), 
+                    visualizer=visualizer, 
+                    method_name=f"resnet50_{train_domain}", 
+                    save_every=20
+                )
+                all_results["deep"][f"resnet50_{train_domain}"][eval_domain] = asdict(result)
+                wandb.log({f"deep_resnet50_{train_domain}_{eval_domain}_accuracy": result.accuracy})
+                
+                print(f"  Accuracy: {result.accuracy:.4f}")
+                print(f"  Top-5 Accuracy: {result.accuracy_top5:.4f}")
+                print(f"  Mean Rank: {result.mean_rank:.2f}")
+    
+    # =========================================================================
+    # Continual Learning
+    # =========================================================================
+    if get_bool(config, "eval_continual", True):
+        print("\n" + "="*70)
+        print("EVALUATING CONTINUAL LEARNING METHODS")
+        print("="*70)
+        
+        all_results["continual"] = {}
+        
+        for source_domain, target_domain in [("illumination", "viewpoint"), ("viewpoint", "illumination")]:
+            transfer_key = f"{source_domain}_to_{target_domain}"
+            print(f"\nContinual Learning: {transfer_key}")
+            
+            source_seqs = data_mgr.get_sequences(source_domain, "train")
+            target_seqs = data_mgr.get_sequences(target_domain, "train")
+            source_triplets = data_mgr.create_training_triplets(
+                source_seqs, config.get("max_triplets", 10000),
+                min_negative_distance=50.0, use_hardest_negative=True,
+            )
+            target_triplets = data_mgr.create_training_triplets(
+                target_seqs, config.get("max_triplets", 10000),
+                min_negative_distance=50.0, use_hardest_negative=True,
+            )
+            
+            source_eval = data_mgr.create_eval_pairs(
+                data_mgr.get_sequences(source_domain, "test"), 
+                config.get("max_pairs_per_seq", 50)
+            )
+            target_eval = data_mgr.create_eval_pairs(
+                data_mgr.get_sequences(target_domain, "test"), 
+                config.get("max_pairs_per_seq", 50)
+            )
+            
+            all_results["continual"][transfer_key] = {}
+            
+            for method in config.get("continual_methods", ["naive", "ewc", "lwf"]):
+                print(f"\n  Method: {method}")
+                
+                print(f"  Training on source domain ({source_domain})...")
+                model = get_descriptor_model("resnet50")
+                model = train_model(
+                    model, source_triplets,
+                    epochs=get_int(config, "epochs_source", 5),
+                    batch_size=get_int(config, "batch_size", 64),
+                    lr=get_float(config, "lr", 1e-4),
+                    device=device,
+                    log_prefix=f"continual_{transfer_key}_{method}_source",
+                )
+                
+                source_before = evaluate_deep(
+                    model, source_eval, device, 
+                    max_distractors=config.get("max_distractors", 100), 
+                    visualizer=visualizer, 
+                    method_name=f"continual_{method}_source_before", 
+                    save_every=20
+                )
+                
+                print(f"  Adapting to target domain ({target_domain})...")
+                model = train_continual(
+                    model, source_triplets, target_triplets,
+                    method=method,
+                    epochs_target=get_int(config, "epochs_target", 5),
+                    batch_size=get_int(config, "batch_size", 64),
+                    lr=get_float(config, "lr", 1e-4),
+                    device=device,
+                    log_prefix=f"continual_{transfer_key}",
+                    ewc_lambda=get_float(config, "ewc_lambda", 400),
+                    lwf_lambda=get_float(config, "lwf_lambda", 1.0),
+                )
+                
+                source_after = evaluate_deep(
+                    model, source_eval, device, 
+                    max_distractors=config.get("max_distractors", 100), 
+                    visualizer=visualizer, 
+                    method_name=f"continual_{method}_source_after", 
+                    save_every=20
+                )
+                target_after = evaluate_deep(
+                    model, target_eval, device, 
+                    max_distractors=config.get("max_distractors", 100), 
+                    visualizer=visualizer, 
+                    method_name=f"continual_{method}_target_after", 
+                    save_every=20
+                )
+                
+                forgetting = source_before.accuracy - source_after.accuracy
+                forgetting_rate = forgetting / source_before.accuracy if source_before.accuracy > 0 else 0
+                
+                all_results["continual"][transfer_key][method] = {
+                    "source_acc_before": source_before.accuracy,
+                    "source_acc_after": source_after.accuracy,
+                    "target_acc_after": target_after.accuracy,
+                    "forgetting": forgetting,
+                    "forgetting_rate": forgetting_rate,
+                    "source_before_details": asdict(source_before),
+                    "source_after_details": asdict(source_after),
+                    "target_after_details": asdict(target_after),
+                }
+                
+                print(f"    Source accuracy before: {source_before.accuracy:.4f}")
+                print(f"    Source accuracy after:  {source_after.accuracy:.4f}")
+                print(f"    Target accuracy after:  {target_after.accuracy:.4f}")
+                print(f"    Forgetting rate:       {forgetting_rate*100:.1f}%")
+                
+                wandb.log({
+                    f"continual_{transfer_key}_{method}_source_acc_before": source_before.accuracy,
+                    f"continual_{transfer_key}_{method}_source_acc_after": source_after.accuracy,
+                    f"continual_{transfer_key}_{method}_target_acc_after": target_after.accuracy,
+                    f"continual_{transfer_key}_{method}_forgetting_rate": forgetting_rate * 100
+                })
+    
+    # =========================================================================
+    # Generate T-SNE Visualizations
+    # =========================================================================
+    print("\n" + "="*70)
+    print("GENERATING T-SNE VISUALIZATIONS")
+    print("="*70)
+    
+    output_dir = Path(config.get("output_dir", "results/benchmark"))
+    tsne_dir = output_dir / "tsne_figures"
+    tsne_dir.mkdir(parents=True, exist_ok=True)
+    
+    tsne_viz = TSNEVisualizer(tsne_dir)
+    
+    # Create samples for T-SNE
+    tsne_samples = []
+    illum_seqs = data_mgr.get_sequences("illumination", "test")[:2]
+    view_seqs = data_mgr.get_sequences("viewpoint", "test")[:2]
+    
+    for seq in illum_seqs:
+        sample = data_mgr.create_tsne_sample(seq, n_distractors=10)
+        if sample:
+            tsne_samples.append(sample)
+    
+    for seq in view_seqs:
+        sample = data_mgr.create_tsne_sample(seq, n_distractors=10)
+        if sample:
+            tsne_samples.append(sample)
+    
+    if tsne_samples and tsne_models:
+        # Create individual T-SNE figures
+        for sample in tsne_samples:
+            for model_name, (model, model_type) in tsne_models.items():
+                if model_type == "sift":
+                    embeddings = tsne_viz.extract_embeddings_sift(sample)
+                else:
+                    embeddings = tsne_viz.extract_embeddings_deep(model, sample, device)
+                
+                coords = tsne_viz.compute_tsne_2d(embeddings)
+                
+                safe_name = model_name.replace(" ", "_").replace("(", "").replace(")", "")
+                tsne_viz.create_tsne_figure(
+                    coords, sample, model_name,
+                    tsne_dir / f"tsne_{safe_name}_{sample.domain}_{sample.seq_name}.png"
+                )
+                
+                tsne_viz.create_global_context_figure(
+                    sample, model_name,
+                    tsne_dir / f"global_{safe_name}_{sample.domain}_{sample.seq_name}.png"
+                )
+        
+        # Create combined comparison figure
+        tsne_viz.create_combined_tsne_figure(
+            tsne_samples, tsne_models, device,
+            tsne_dir / "tsne_comparison_all_models.png"
+        )
+    
+    # =========================================================================
+    # Generate Qualitative Matching Comparisons
+    # =========================================================================
+    if get_bool(config, "generate_comparisons", True) and tsne_models:
+        print("\\n" + "="*70)
+        print("GENERATING MATCHING COMPARISONS (SIFT vs Learned)")
+        print("="*70)
+        
+        comparison_dir = output_dir / "matching_comparisons"
+        comparison_viz = MatchingComparisonVisualizer(comparison_dir)
+        
+        # Use the best learned model (viewpoint-trained for viewpoint, illumination-trained for illumination)
+        for model_name, (model, model_type) in tsne_models.items():
+            if model_type == "deep" and model is not None:
+                comparison_viz.generate_comparisons(
+                    data_mgr=data_mgr,
+                    model=model,
+                    device=device,
+                    n_examples=3,
+                    max_distractors=100,
+                    model_name=model_name
+                )
+                break  # Just use one model for comparisons
+    
+    # =========================================================================
+    # Generate Paper Figures
+    # =========================================================================
+    print("\n" + "="*70)
+    print("GENERATING PAPER FIGURES")
+    print("="*70)
+    
+    figures_dir = output_dir / "paper_figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    
+    create_methodology_figure(figures_dir)
+    
+    # =========================================================================
+    # Generate Standard Visualizations
+    # =========================================================================
+    print("\n" + "="*70)
+    print("GENERATING STANDARD VISUALIZATIONS")
+    print("="*70)
+    
+    visualizer.create_all_figures(results=all_results)
+    
+    # Save results
+    results_file = output_dir / "results.json"
+    with open(results_file, "w") as f:
+        json.dump(all_results, f, indent=2, default=str)
+    
+    summary = visualizer.get_summary()
+    summary_file = output_dir / "summary.json"
+    with open(summary_file, "w") as f:
+        json.dump(summary, f, indent=2)
+    
+    print(f"\nResults saved to: {results_file}")
+    print(f"Summary saved to: {summary_file}")
+    
+    # Print comprehensive summary
+    print("\n" + "="*70)
+    print("COMPREHENSIVE SUMMARY")
+    print("="*70)
+    
+    if "traditional" in all_results:
+        print("\nTraditional Methods:")
+        print("  Method    | Illumination | Viewpoint")
+        print("  ----------|--------------|----------")
+        for method in ["sift", "orb", "brisk"]:
+            illum = all_results["traditional"]["illumination"].get(method, {}).get("accuracy", 0)
+            view = all_results["traditional"]["viewpoint"].get(method, {}).get("accuracy", 0)
+            print(f"  {method.upper():<9} | {illum:.4f}       | {view:.4f}")
+    
+    if "deep" in all_results:
+        print("\nDeep Learning Methods:")
+        print("  Model           | Illumination | Viewpoint")
+        print("  ----------------|--------------|-----------")
+        for key, data in all_results["deep"].items():
+            illum = data.get("illumination", {}).get("accuracy", 0)
+            view = data.get("viewpoint", {}).get("accuracy", 0)
+            print(f"  {key:<15} | {illum:.4f}       | {view:.4f}")
+    
+    if "continual" in all_results:
+        print("\nContinual Learning:")
+        print("  Transfer        | Method | Src Before | Src After | Target | Forgetting")
+        print("  ----------------|--------|------------|-----------|--------|----------")
+        for transfer, methods in all_results["continual"].items():
+            for method, data in methods.items():
+                src_b = data.get("source_acc_before", 0)
+                src_a = data.get("source_acc_after", 0)
+                tgt = data.get("target_acc_after", 0)
+                forg = data.get("forgetting_rate", 0) * 100
+                print(f"  {transfer[:15]:<15} | {method:<6} | {src_b:.4f}     | {src_a:.4f}    | {tgt:.4f} | {forg:5.1f}%")
+    
+    wandb.save(str(results_file))
+    wandb.save(str(summary_file))
+    wandb.finish()
+    
+    print("\n" + "="*70)
+    print("BENCHMARK COMPLETED SUCCESSFULLY")
+    print("="*70)
+    
+    return all_results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Feature Matching Benchmark (Final)")
+    parser.add_argument("--config", type=str, help="Path to config YAML")
+    parser.add_argument("--quick", action="store_true", help="Quick test")
+    parser.add_argument("--hpatches", type=str, help="HPatches root")
+    parser.add_argument("--output_dir", type=str, help="Output directory")
+    args = parser.parse_args()
+    
+    # Default config (no MAML)
+    config = {
+        "hpatches_root": "/Data/adrian.garcia/hpatches/hpatches",
+        "seed": 42,
+        "eval_traditional": False,
+        "eval_deep": True,
+        "eval_continual": True,
+        "deep_epochs": 5,
+        "epochs_source": 5,
+        "epochs_target": 5,
+        "lr": 5e-5,
+        "batch_size": 32,
+        "max_triplets": 50000,
+        "max_pairs_per_seq": 1000,
+        "max_distractors": 1000,
+        "continual_methods": ["naive", "ewc", "lwf"],
+        "ewc_lambda": 400,
+        "lwf_lambda": 1.0,
+        "output_dir": "results/paper_results",
+    }
+    
+    if args.config:
+        with open(args.config) as f:
+            loaded = yaml.safe_load(f)
+            if loaded:
+                # Remove MAML if present
+                loaded.pop("eval_maml", None)
+                config.update(loaded)
+    
+    if args.hpatches:
+        config["hpatches_root"] = args.hpatches
+    
+    if args.output_dir:
+        config["output_dir"] = args.output_dir
+    
+    if args.quick:
+        config.update({
+            "deep_epochs": 5,
+            "epochs_source": 5,
+            "epochs_target": 5,
+            "max_triplets": 5000,
+            "max_pairs_per_seq": 20,
+            "max_distractors": 50,
+            "continual_methods": ["naive", "ewc"],
+            "output_dir": "results/quick_test",
+        })
+    
+    run_benchmark(config)
+
+
+if __name__ == "__main__":
+    main()
