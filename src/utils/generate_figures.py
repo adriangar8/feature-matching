@@ -113,7 +113,7 @@ def create_methodology_figure(output_dir: Path):
                     s=120, marker='^', edgecolors='black', linewidths=1.5, label='Query')
     
     # Draw margin circle
-    circle = plt.Circle((0, 0), 0.3, fill=False, color='gray', linestyle='--', linewidth=1.5)
+    circle = plt.Circle((0, 0), 0.3, fill=False, color='gray', linestyle='--', linewidth=1.5) # type: ignore
     ax_after.add_patch(circle)
     ax_after.text(0.35, -0.1, 'm', fontsize=9, color='gray', style='italic')
     

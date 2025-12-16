@@ -37,7 +37,7 @@ def run_benchmark(config: Dict) -> Dict:
     set_seed(seed)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    hpatches_root = config.get("hpatches_root", "/Data/adrian.garcia/hpatches/hpatches")
+    hpatches_root = config.get("hpatches_root", "dataset/hpatches")
     
     data_mgr = HPatchesManager(hpatches_root, test_ratio=0.2, seed=seed)
     

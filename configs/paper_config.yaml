@@ -1,33 +1,43 @@
-# Data location
-hpatches_root: "/Data/adrian.garcia/hpatches/hpatches"
+# Configuration for Full Paper Experiments
 
-# Reproducibility
+# Dataset
+hpatches_root: "dataset/hpatches"
+
+# Random seed for reproducibility
 seed: 42
 
-eval_traditional: false
+# Which evaluations to run
+eval_traditional: true
 eval_deep: true
 eval_continual: true
 
-# Training settings
+# Deep Learning Training Hyperparameters
 deep_epochs: 5
 epochs_source: 5
 epochs_target: 5
 lr: 0.00005
 batch_size: 32
 
-# Data settings
+# Data Generation Parameters
 max_triplets: 50000
 max_pairs_per_seq: 1000
 max_distractors: 1000
 
-# Continual learning
+# Continual Learning Methods
 continual_methods:
-  - naive
-  - ewc
-  - lwf
+    - naive
+    - ewc
+    - lwf
 
+# Continual Learning Hyperparameters
 ewc_lambda: 400
 lwf_lambda: 1.0
 
-# Output
-output_dir: results/paper_results
+# Output Configuration
+output_dir: "results/paper_results"
+generate_comparisons: true
+
+# Visualization Settings
+save_patches: true
+save_tsne: true
+save_global_context: true

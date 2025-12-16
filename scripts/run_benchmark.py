@@ -25,7 +25,7 @@ def main():
     
     # Default config (no MAML)
     config = {
-        "hpatches_root": "/Data/adrian.garcia/hpatches/hpatches",
+        "hpatches_root": "dataset/hpatches",
         "seed": 42,
         "eval_traditional": False,
         "eval_deep": True,
