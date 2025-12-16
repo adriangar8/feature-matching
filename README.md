@@ -331,7 +331,7 @@ python scripts/run_benchmark.py --quick
 
 ### Demo Video
 
-You can view the demo video by clicking [here](assets/p09_demo_video.mp4).
+View the demo video by clicking [here](assets/p09_demo_video.mp4).
 
 ## License
 
